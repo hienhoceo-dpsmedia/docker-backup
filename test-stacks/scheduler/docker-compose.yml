@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  scheduler_db:
+    container_name: scheduler_db
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: scheduler
+    volumes:
+      - scheduler_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      default:
+        aliases:
+          - db
+      nginx-proxy-manager_default:
+
+
+  scheduler_api:
+    container_name: scheduler_api
+    image: ghcr.io/hienhoceo-dpsmedia/scheduler-api:main
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: scheduler_db
+      POSTGRES_DB: scheduler
+      # --- ADMIN CONFIG ---
+      ADMIN_SECRET: ${ADMIN_SECRET}
+      # --- SMTP CONFIG ---
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      # Chú ý: SMTP_SECURE phải là chuỗi 'true' hoặc 'false' (chữ thường)
+      SMTP_SECURE: ${SMTP_SECURE}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+    depends_on:
+      - scheduler_db
+    ports:
+      - "5002:5000"
+    networks:
+      default:
+        aliases:
+          - api
+      nginx-proxy-manager_default:
+
+
+  scheduler_web:
+    container_name: scheduler_web
+    image: ghcr.io/hienhoceo-dpsmedia/scheduler-web:main
+    restart: always
+    ports:
+      - "5001:80"
+    depends_on:
+      - scheduler_api
+    networks:
+      - default
+      - nginx-proxy-manager_default
+
+volumes:
+  scheduler_pgdata:
+
+networks:
+  nginx-proxy-manager_default:
+    external: true

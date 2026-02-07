@@ -15,7 +15,7 @@ services:
       # - ./rclone.conf:/root/.config/rclone/rclone.conf # Uncomment to enable rclone config
     environment:
       - NODE_ENV=production
-      - TELEGRAM_TOKEN=7244297716:AAG4E73PKTKFxkmm2dbddfQX40fNBqlEgG4
-      - TELEGRAM_API_ROOT=https://tele.dpsmedia.vn
-      - CHAT_ID=-1001794009966
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_API_ROOT=${TELEGRAM_API_ROOT:-}
+      - CHAT_ID=${CHAT_ID:-}
       - TZ=Asia/Ho_Chi_Minh

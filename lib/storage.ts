@@ -8,6 +8,23 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+const STACKS_FILE = path.join(DATA_DIR, 'stacks.json');
+
+export interface ParsedService {
+    name: string;
+    image: string;
+    volumes: string[];
+    env: Record<string, string>;
+}
+
+export interface StackConfig {
+    name: string;
+    yaml: string;
+    envFile?: string; // Optional path to .env file on filesystem
+    envVars?: Record<string, string>; // Environment variables (key-value pairs)
+    services: Record<string, ParsedService>;
+    lastUpdated: string;
+}
 
 export interface ScheduleConfig {
     frequency: 'manual' | 'daily' | 'weekly';
@@ -70,4 +87,26 @@ export function addHistoryEntry(entry: HistoryEntry) {
     // Limit history size
     if (history.length > 200) history.pop();
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+}
+
+// Stack Management
+export function getStacks(): Record<string, StackConfig> {
+    if (!fs.existsSync(STACKS_FILE)) return {};
+    try {
+        return JSON.parse(fs.readFileSync(STACKS_FILE, 'utf-8'));
+    } catch {
+        return {};
+    }
+}
+
+export function saveStack(stack: StackConfig) {
+    const stacks = getStacks();
+    stacks[stack.name] = stack;
+    fs.writeFileSync(STACKS_FILE, JSON.stringify(stacks, null, 2));
+}
+
+export function deleteStack(name: string) {
+    const stacks = getStacks();
+    delete stacks[name];
+    fs.writeFileSync(STACKS_FILE, JSON.stringify(stacks, null, 2));
 }
