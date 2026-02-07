@@ -75,6 +75,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     const [selectedContainers, setSelectedContainers] = useState<string[]>([]);
     const [isUploading, setIsUploading] = useState(false);
     const [isRestoring, setIsRestoring] = useState(false);
+    const [customPaths, setCustomPaths] = useState<Record<string, string>>({});
 
     // Filter containers based on search
     const filteredContainers = containers.filter(c =>
@@ -111,7 +112,14 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     }, []);
 
     const handleBackup = async (ids: string[]) => {
-        const res = await triggerBackup(ids);
+        const pathsMap: Record<string, string[]> = {};
+        ids.forEach(id => {
+            if (customPaths[id]) {
+                pathsMap[id] = customPaths[id].split(',').map(p => p.trim()).filter(p => p !== '');
+            }
+        });
+
+        const res = await triggerBackup(ids, pathsMap);
         if (res.success) {
             setSelectedContainers([]);
             alert(`Started backup for ${res.count} containers`);
@@ -301,6 +309,8 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                             progress={progress[container.Id]}
                                             isSelected={selectedContainers.includes(container.Id)}
                                             onToggle={() => toggleSelection(container.Id)}
+                                            customPath={customPaths[container.Id] || ''}
+                                            onCustomPathChange={(val) => setCustomPaths(prev => ({ ...prev, [container.Id]: val }))}
                                         />
                                     ))}
                                 </div>
@@ -546,12 +556,14 @@ function StatCard({ icon, label, value, color }: { icon: React.ReactNode, label:
     );
 }
 
-function ContainerRow({ container, onBackup, progress, isSelected, onToggle }: {
+function ContainerRow({ container, onBackup, progress, isSelected, onToggle, customPath, onCustomPathChange }: {
     container: Container,
     onBackup: () => void,
     progress?: any,
     isSelected: boolean,
-    onToggle: () => void
+    onToggle: () => void,
+    customPath: string,
+    onCustomPathChange: (val: string) => void
 }) {
     const isRunning = container.State === 'running';
     const appType = detectApp(container);
@@ -619,11 +631,30 @@ function ContainerRow({ container, onBackup, progress, isSelected, onToggle }: {
                     <p className="text-[10px] text-slate-500 mt-2 italic truncate">{progress.message}</p>
                 </div>
             ) : (
-                <div className="flex items-center gap-3 opacity-0 group-hover:opacity-100 transition-all">
+                <div className="flex items-center gap-4">
+                    <div className="flex flex-col gap-1 items-end">
+                        <div className="relative">
+                            <input
+                                type="text"
+                                placeholder="Custom paths (e.g. /app, /data)"
+                                value={customPath}
+                                onChange={(e) => onCustomPathChange(e.target.value)}
+                                className="bg-slate-900/50 border border-slate-700/50 rounded-lg py-1.5 px-3 text-[10px] text-slate-300 w-48 focus:ring-1 focus:ring-blue-500/50 outline-none transition-all placeholder:text-slate-600 group-hover:border-slate-600"
+                            />
+                            {isRunning && appType === 'generic' && !customPath && (
+                                <div className="absolute -left-6 top-1.5 group/warn">
+                                    <AlertCircle className="w-4 h-4 text-orange-500/50 hover:text-orange-400 transition-colors cursor-help" />
+                                    <div className="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 text-[10px] text-slate-300 rounded shadow-xl opacity-0 invisible group-hover/warn:opacity-100 group-hover/warn:visible transition-all z-30 pointer-events-none border border-slate-700">
+                                        No volumes detected. We will backup the container's <b>WorkingDir</b>. Enter paths above to override.
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
                     <button
                         onClick={onBackup}
                         disabled={!isRunning}
-                        className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-sm font-semibold rounded-xl border border-slate-700 transition-all active:scale-95 disabled:opacity-30 flex items-center gap-2"
+                        className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-sm font-semibold rounded-xl border border-slate-700 transition-all active:scale-95 disabled:opacity-30 flex items-center gap-2 group-hover:bg-blue-600 group-hover:border-blue-500"
                     >
                         <Play className="w-3.5 h-3.5 fill-current" />
                         Start Backup

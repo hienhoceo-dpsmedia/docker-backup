@@ -49,13 +49,14 @@ export async function getProgress() {
     return getAllJobs();
 }
 
-export async function triggerBackup(containerIds: string[]) {
+export async function triggerBackup(containerIds: string[], customPathsMap?: Record<string, string[]>) {
     // Add all to queue
     for (const id of containerIds) {
         updateJobStatus(id, 'pending', 'Queued');
 
+        const customPaths = customPathsMap?.[id];
         backupQueue.add(async () => {
-            await processBackup(id);
+            await processBackup(id, customPaths);
         });
     }
     revalidatePath('/');
@@ -63,14 +64,14 @@ export async function triggerBackup(containerIds: string[]) {
 }
 
 // The Worker Function
-async function processBackup(containerId: string) {
+async function processBackup(containerId: string, customPaths?: string[]) {
     try {
         updateJobStatus(containerId, 'processing', 'Identifying...');
         const backupDir = path.join(process.cwd(), 'backups');
         if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
 
         // Generate the backup file
-        const filePath = await generateBackupFile(containerId, backupDir);
+        const filePath = await generateBackupFile(containerId, backupDir, customPaths);
 
         // Handle Upload
         await handleUpload(containerId, filePath);
@@ -142,7 +143,7 @@ function detectAppType(image: string, labels: Record<string, string> = {}): stri
 }
 
 // Helper: Generates the backup artifact (Zip) on disk
-async function generateBackupFile(containerId: string, backupDir: string): Promise<string> {
+async function generateBackupFile(containerId: string, backupDir: string, customPaths?: string[]): Promise<string> {
     updateJobStatus(containerId, 'processing', 'Step: Inspecting Container...');
     const container = docker.getContainer(containerId);
     const info = await container.inspect();
@@ -304,6 +305,22 @@ async function generateBackupFile(containerId: string, backupDir: string): Promi
             if (image.includes(appKey)) {
                 paths.forEach(p => pathsToBackup.add(p));
             }
+        }
+
+        // Add custom paths if provided
+        if (customPaths && customPaths.length > 0) {
+            customPaths.forEach(p => {
+                if (p.trim()) pathsToBackup.add(p.trim());
+            });
+        }
+
+        // SMART FALLBACK: If still empty, use WorkingDir
+        if (pathsToBackup.size === 0 && info.Config.WorkingDir) {
+            console.log(`[Backup] No volumes found for ${name}. Falling back to WorkingDir: ${info.Config.WorkingDir}`);
+            pathsToBackup.add(info.Config.WorkingDir);
+        } else if (pathsToBackup.size === 0) {
+            // Extreme fallback if even WorkingDir is empty
+            pathsToBackup.add('/app');
         }
 
         const uniquePaths = Array.from(pathsToBackup);
