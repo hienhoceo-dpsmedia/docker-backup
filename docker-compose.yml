@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  backup-manager:
+    build: .
+    container_name: backup-manager
+    restart: unless-stopped
+    user: root
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./backups:/app/backups
+      - ./data:/app/data
+      # - ./rclone.conf:/root/.config/rclone/rclone.conf # Uncomment to enable rclone config
+    environment:
+      - NODE_ENV=production
+      - TELEGRAM_TOKEN=7244297716:AAG4E73PKTKFxkmm2dbddfQX40fNBqlEgG4
+      - TELEGRAM_API_ROOT=https://tele.dpsmedia.vn
+      - CHAT_ID=-1001794009966
+      - TZ=Asia/Ho_Chi_Minh
