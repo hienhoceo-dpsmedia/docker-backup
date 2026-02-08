@@ -19,8 +19,13 @@ FROM base AS runner
 WORKDIR /app
 ENV NODE_ENV production
 
-# Install Rclone, DB Clients, and Curl
-RUN apk add --no-cache rclone curl
+# Install Rclone, DB Clients, Curl, and Docker Compose (V2)
+RUN apk add --no-cache rclone curl docker-cli docker-cli-compose
+
+# Create docker-compose wrapper to force V2 usage
+RUN echo "#!/bin/sh" > /usr/local/bin/docker-compose && \
+    echo "exec docker compose \"\$@\"" >> /usr/local/bin/docker-compose && \
+    chmod +x /usr/local/bin/docker-compose
 
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
