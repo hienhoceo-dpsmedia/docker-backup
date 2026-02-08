@@ -35,6 +35,7 @@ export interface ScheduleConfig {
 export interface AppSettings {
     globalSchedule?: ScheduleConfig; // Legacy or default
     containerSchedules: Record<string, ScheduleConfig>; // key: containerId, value: config
+    stackSchedules: Record<string, ScheduleConfig>; // key: stackName, value: config
     telegramEnabled: boolean;
     retentionCount: number;
 }
@@ -52,6 +53,7 @@ export interface HistoryEntry {
 
 const DEFAULT_SETTINGS: AppSettings = {
     containerSchedules: {},
+    stackSchedules: {},
     telegramEnabled: !!process.env.TELEGRAM_TOKEN,
     retentionCount: 5,
 };
@@ -62,6 +64,7 @@ export function getSettings(): AppSettings {
         const data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
         // Migrate old settings if needed
         if (!data.containerSchedules) data.containerSchedules = {};
+        if (!data.stackSchedules) data.stackSchedules = {};
         return data;
     } catch {
         return DEFAULT_SETTINGS;

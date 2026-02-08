@@ -2,6 +2,7 @@
 
 import docker from '@/lib/docker';
 import { backupQueue, updateJobStatus, getAllJobs } from '@/lib/queue';
+import { initScheduler } from '@/lib/scheduler';
 import {
     addHistoryEntry,
     getHistory,
@@ -39,7 +40,9 @@ export async function getSettingsAction() {
 }
 
 export async function saveSettingsAction(settings: AppSettings) {
-    return saveSettings(settings);
+    saveSettings(settings);
+    initScheduler(); // Reload schedules
+    return { success: true };
 }
 
 // Stack Actions

@@ -24,7 +24,8 @@ import {
     Plus,
     Activity,
     Layers,
-    Terminal
+    Terminal,
+    Calendar
 } from 'lucide-react';
 import {
     getContainers,
@@ -90,6 +91,11 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     const [yamlInput, setYamlInput] = useState('');
     const [stackNameInput, setStackNameInput] = useState(''); // Custom stack name
     const [envFileInput, setEnvFileInput] = useState(''); // Path to .env file
+
+    // Schedule Modal State
+    const [showScheduleModal, setShowScheduleModal] = useState(false);
+    const [schedulingStack, setSchedulingStack] = useState<string | null>(null);
+    const [tempSchedule, setTempSchedule] = useState<any>({ frequency: 'daily', time: '02:00', dayOfWeek: 0 });
 
     // Filter containers based on search
     const filteredContainers = containers.filter(c =>
@@ -277,6 +283,30 @@ export default function DashboardClient({ initialContainers }: { initialContaine
         } else {
             alert(`Failed: ${res.error}`);
         }
+    };
+
+    const handleOpenSchedule = (stackName: string) => {
+        setSchedulingStack(stackName);
+        const existing = settings?.stackSchedules?.[stackName] || { frequency: 'manual', time: '02:00', dayOfWeek: 0 };
+        setTempSchedule(existing);
+        setShowScheduleModal(true);
+    };
+
+    const handleSaveSchedule = async () => {
+        if (!schedulingStack || !settings) return;
+
+        const newSettings: AppSettings = {
+            ...settings,
+            stackSchedules: {
+                ...(settings.stackSchedules || {}),
+                [schedulingStack]: tempSchedule
+            }
+        };
+
+        setSettings(newSettings);
+        await saveSettingsAction(newSettings);
+        setShowScheduleModal(false);
+        setSchedulingStack(null);
     };
 
     return (
@@ -768,6 +798,24 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                                         </div>
                                                     </div>
                                                     <div className="flex items-center gap-3">
+                                                        <div className="hidden group-hover:block transition-all animate-in fade-in slide-in-from-right-2">
+                                                            <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5">
+                                                                <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                                                                <span className="text-[10px] font-bold text-slate-400 capitalize">
+                                                                    {settings?.stackSchedules?.[stack.name]?.frequency === 'manual' || !settings?.stackSchedules?.[stack.name]
+                                                                        ? 'No Schedule'
+                                                                        : `${settings?.stackSchedules[stack.name].frequency} @ ${settings?.stackSchedules[stack.name].time}`}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => handleOpenSchedule(stack.name)}
+                                                            className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold rounded-lg border border-slate-700 transition-all active:scale-95"
+                                                            title="Configure Backup Schedule"
+                                                        >
+                                                            <Clock className="w-3.5 h-3.5" />
+                                                            Schedule
+                                                        </button>
                                                         <button
                                                             onClick={() => handleStackBackup(stack.name)}
                                                             className="flex items-center gap-2 px-3 py-1.5 bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white text-xs font-bold rounded-lg border border-blue-500/20 transition-all active:scale-95 group/btn"
@@ -895,8 +943,101 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                     </div >
                 )
                 }
-            </main >
-        </div >
+
+                {/* Schedule Modal */}
+                {showScheduleModal && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+                        <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" onClick={() => setShowScheduleModal(false)} />
+                        <div className="relative bg-[#0b1120] border border-slate-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+                            <div className="p-8 border-b border-slate-800/50 flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                    <div className="p-2 bg-blue-600/20 rounded-lg">
+                                        <Clock className="w-5 h-5 text-blue-500" />
+                                    </div>
+                                    <h3 className="text-xl font-bold text-white truncate max-w-[200px]">Schedule: {schedulingStack}</h3>
+                                </div>
+                                <button onClick={() => setShowScheduleModal(false)} className="text-slate-500 hover:text-white">
+                                    <XCircle className="w-6 h-6" />
+                                </button>
+                            </div>
+                            <div className="p-8 space-y-6">
+                                <div className="space-y-3">
+                                    <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Backup Frequency</label>
+                                    <div className="grid grid-cols-1 gap-2">
+                                        {['manual', 'daily', 'weekly'].map((freq) => (
+                                            <button
+                                                key={freq}
+                                                onClick={() => setTempSchedule((prev: any) => ({ ...prev, frequency: freq }))}
+                                                className={cn(
+                                                    "w-full px-4 py-3 rounded-xl border text-sm font-bold transition-all text-left flex items-center justify-between",
+                                                    tempSchedule.frequency === freq
+                                                        ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-500/20"
+                                                        : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                                                )}
+                                            >
+                                                <span className="capitalize">{freq}</span>
+                                                {tempSchedule.frequency === freq && <CheckCircle2 className="w-4 h-4" />}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {tempSchedule.frequency !== 'manual' && (
+                                    <div className="animate-in fade-in slide-in-from-top-2 duration-300 space-y-6">
+                                        <div className="space-y-3">
+                                            <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Preferred Time</label>
+                                            <input
+                                                type="time"
+                                                value={tempSchedule.time}
+                                                onChange={(e: any) => setTempSchedule((prev: any) => ({ ...prev, time: e.target.value }))}
+                                                className="w-full bg-slate-950 border border-slate-800 rounded-2xl p-4 text-white font-mono focus:ring-2 focus:ring-blue-500 outline-none"
+                                            />
+                                        </div>
+
+                                        {tempSchedule.frequency === 'weekly' && (
+                                            <div className="space-y-3">
+                                                <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Day of week</label>
+                                                <div className="grid grid-cols-7 gap-1">
+                                                    {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((day, i) => (
+                                                        <button
+                                                            key={i}
+                                                            onClick={() => setTempSchedule((prev: any) => ({ ...prev, dayOfWeek: i }))}
+                                                            className={cn(
+                                                                "h-10 rounded-lg text-xs font-bold transition-all",
+                                                                tempSchedule.dayOfWeek === i
+                                                                    ? "bg-blue-600 text-white shadow-md shadow-blue-500/20"
+                                                                    : "bg-slate-900 text-slate-500 hover:bg-slate-800"
+                                                            )}
+                                                        >
+                                                            {day}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                <div className="pt-4 flex gap-4">
+                                    <button
+                                        onClick={() => setShowScheduleModal(false)}
+                                        className="flex-1 px-6 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl border border-slate-700 transition-all"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={handleSaveSchedule}
+                                        className="flex-1 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-lg shadow-blue-500/20 transition-all"
+                                    >
+                                        Save Plan
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </main>
+        </div>
     );
 }
 
@@ -937,7 +1078,7 @@ function StatCard({ icon, label, value, color }: { icon: React.ReactNode, label:
 }
 
 function ContainerRow({ container, onBackup, progress, isSelected, onToggle, customPath, onCustomPathChange, stackName, hasStackConfig }: {
-    container: Container,
+    container: any,
     onBackup: () => void,
     progress?: any,
     isSelected: boolean,
@@ -1063,7 +1204,7 @@ function ContainerRow({ container, onBackup, progress, isSelected, onToggle, cus
     );
 }
 
-function detectApp(container: Container): 'database' | 'generic' {
+function detectApp(container: any): 'database' | 'generic' {
     const dbImages = ['postgres', 'mysql', 'mariadb', 'redis', 'mongo'];
     if (dbImages.some(db => container.Image.toLowerCase().includes(db))) return 'database';
     return 'generic';
