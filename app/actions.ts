@@ -678,8 +678,9 @@ async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: stri
                 `.trim();
 
                 // Connect as the actual pgUser with its actual password, targeting 'postgres' maintenance DB
+                // We use single quotes for the -c argument to prevent shell interpolation of $$
                 const syncExec = await container.exec({
-                    Cmd: ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d 'postgres' -c "${sqlSequence.replace(/"/g, '\\"')}"`],
+                    Cmd: ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d 'postgres' -c '${sqlSequence.replace(/'/g, "'\\''")}'`],
                     AttachStdout: true,
                     AttachStderr: true
                 });
