@@ -548,8 +548,16 @@ export async function listBackups() {
 }
 
 // Helper: Restore a single container from a Zip (used by both single and unified restore)
-async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix: string = '') {
+async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
     const container = docker.getContainer(containerId);
+
+    // Helper to resolve ${VAR} placeholders using envMap or process.env
+    const resolveValue = (val: string): string => {
+        if (!val) return val;
+        return val.replace(/\${([^}:-]+)(?::-([^}]*))?}/g, (_, key, defaultValue) => {
+            return envMap?.[key] || process.env[key] || defaultValue || '';
+        });
+    };
 
     // 1. Try to find config.json for this container
     const configPath = path.join(prefix, 'config.json').replace(/\\/g, '/');
@@ -587,9 +595,9 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
         let pgDb: string | undefined;
 
         if (image.includes('postgres') || image.includes('timescale')) {
-            pgUser = env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres';
-            pgPwd = env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1];
-            pgDb = env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser;
+            pgUser = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres');
+            pgPwd = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1] || '');
+            pgDb = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser);
 
             // Use template1 for initial connection if pgDb might not be ready, 
             // but for restore we want to target pgDb.
@@ -876,14 +884,25 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
         const tempComposeFile = path.join(backupDir, `temp_${stackName}_${Date.now()}.yml`);
         fs.writeFileSync(tempComposeFile, resolvedYaml); // Use resolved YAML
 
-        // Extract and save .env file if present
+        // Extract and parse .env file if present
         const envEntry = zip.getEntry('.env');
         let tempEnvFile: string | undefined;
+        const envMap: Record<string, string> = {};
+
         if (envEntry) {
             const envContent = envEntry.getData().toString('utf8');
             tempEnvFile = path.join(backupDir, `temp_${stackName}_${Date.now()}.env`);
             fs.writeFileSync(tempEnvFile, envContent);
-            updateJobStatus(virtualId, 'processing', `Extracted .env file...`);
+
+            // Parse .env into envMap
+            envContent.split('\n').forEach(line => {
+                const trimmed = line.trim();
+                if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+                    const [key, ...parts] = trimmed.split('=');
+                    envMap[key.trim()] = parts.join('=').trim();
+                }
+            });
+            updateJobStatus(virtualId, 'processing', `Extracted and parsed .env file...`);
         }
 
         let targetContainers: any[] = [];
@@ -990,7 +1009,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                 updateJobStatus(virtualId, 'processing', `💾 Injecting data into ${db.name}...`);
                 try {
                     const zipPrefix = `services/${service.name}`;
-                    await restoreContainerInternal(db.containerId, zip, zipPrefix);
+                    await restoreContainerInternal(db.containerId, zip, zipPrefix, envMap);
                     console.log(`[Unified Restore] ✅ Database ${db.name} restored`);
                 } catch (err: any) {
                     console.error(`[Unified Restore] ❌ Failed to restore database ${db.name}:`, err);
