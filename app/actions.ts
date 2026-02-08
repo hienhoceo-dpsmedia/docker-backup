@@ -599,11 +599,18 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
             pgPwd = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1] || '');
             pgDb = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser);
 
-            // Use template1 for initial connection if pgDb might not be ready, 
-            // but for restore we want to target pgDb.
+            // LOGGING FOR DEBUGGING
+            console.log(`[Restore] DB Context: User=${pgUser}, DB=${pgDb}, HasPwd=${!!pgPwd}, EnvMapKeys=${Object.keys(envMap || {}).join(',')}`);
+
+            // For PGDUMPALL restore, we SHOULD target the 'postgres' database or 'template1'
+            // because the dump contains 'CREATE DATABASE' commands for pgDb.
+            // Connecting directly to pgDb might fail if it doesn't exist yet.
+            const targetDb = 'postgres';
             cmd = pgPwd
-                ? ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d '${pgDb}'`]
-                : ['psql', '-U', pgUser, '-d', pgDb];
+                ? ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d '${targetDb}'`]
+                : ['psql', '-U', pgUser, '-d', targetDb];
+
+            console.log(`[Restore] Targeting database "${targetDb}" for full dump restoration...`);
         } else {
             // Mysql
             const env = info.Config.Env || [];
@@ -630,17 +637,18 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
             exec.start({ hijack: true, stdin: true }, (err: any, stream: any) => {
                 if (err) { clearTimeout(timeout); return reject(err); }
 
+                let restoreOutput = '';
+                stream.on('data', (chunk: Buffer) => { restoreOutput += chunk.toString(); });
+
                 fileStream.pipe(stream);
 
-                // Docker streams sometimes don't emit end correctly on stdin pipe, 
-                // but fileStream end is reliable for input.
                 fileStream.on('end', () => {
-                    // Give it a moment to flush
                     setTimeout(() => {
                         stream.end();
                         clearTimeout(timeout);
+                        console.log(`[Restore] SQL Restore finished. Final output snippet: ${restoreOutput.slice(-200)}`);
                         resolve();
-                    }, 1000);
+                    }, 2000); // 2s flush for large dumps
                 });
                 stream.on('error', (e: any) => { clearTimeout(timeout); reject(e); });
             });
@@ -1037,7 +1045,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                 if (hasData) {
                     updateJobStatus(virtualId, 'processing', `🚚 Restoring volumes for ${app.name}...`);
                     try {
-                        await restoreContainerInternal(app.containerId, zip, zipPrefix);
+                        await restoreContainerInternal(app.containerId, zip, zipPrefix, envMap);
                         console.log(`[Unified Restore] ✅ Application volumes ${app.name} restored`);
                     } catch (err: any) {
                         console.error(`[Unified Restore] ❌ Failed to restore volumes for ${app.name}:`, err);
