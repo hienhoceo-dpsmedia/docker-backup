@@ -859,6 +859,17 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
             }
         }
 
+        // Resolve healthcheck conflicts (strip/downgrade to avoid blocks)
+        const hcResolution = resolveHealthcheckConflicts(resolvedYaml);
+        resolvedYaml = hcResolution.yaml;
+
+        if (hcResolution.removed.length > 0) {
+            updateJobStatus(virtualId, 'processing', `🏥 Bypassing healthchecks during restore...`);
+            for (const msg of hcResolution.removed) {
+                console.log(`[Conflict Resolution] ${msg}`);
+            }
+        }
+
         // Import the stack configuration
         const importRes = await importStackAction(resolvedYaml, stackName);
         if (!importRes.success) {
@@ -1264,6 +1275,50 @@ function resolveNetworkConflicts(composeYaml: string): { yaml: string; removed: 
         return { yaml: newYaml, removed };
     } catch (error: any) {
         console.error('[Conflict Resolution] Failed to remove static IPs:', error);
+        return { yaml: composeYaml, removed: [] };
+    }
+}
+
+// Helper: Strip healthchecks and downgrade depends_on to avoid blocking during volatile restore
+function resolveHealthcheckConflicts(composeYaml: string): { yaml: string; removed: string[] } {
+    try {
+        const doc = yaml.load(composeYaml) as any;
+        const removed: string[] = [];
+
+        if (!doc || !doc.services) {
+            return { yaml: composeYaml, removed };
+        }
+
+        for (const [serviceName, serviceRaw] of Object.entries(doc.services as any)) {
+            const service = serviceRaw as any;
+
+            // 1. Strip healthcheck
+            if (service.healthcheck) {
+                removed.push(`Healthcheck from ${serviceName}`);
+                delete service.healthcheck;
+            }
+
+            // 2. Downgrade depends_on condition
+            if (service.depends_on) {
+                if (Array.isArray(service.depends_on)) {
+                    // Array format: depends_on: [db, redis]
+                } else {
+                    // Object format: depends_on: { db: { condition: service_healthy } }
+                    for (const [depName, depConfig] of Object.entries(service.depends_on)) {
+                        const config = depConfig as any;
+                        if (config && config.condition === 'service_healthy') {
+                            removed.push(`Downgraded ${serviceName} dependency on ${depName} to service_started`);
+                            config.condition = 'service_started';
+                        }
+                    }
+                }
+            }
+        }
+
+        const newYaml = yaml.dump(doc, { lineWidth: -1, noRefs: true });
+        return { yaml: newYaml, removed };
+    } catch (error: any) {
+        console.error('[Conflict Resolution] Failed to resolve healthcheck conflicts:', error);
         return { yaml: composeYaml, removed: [] };
     }
 }
