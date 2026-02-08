@@ -663,7 +663,9 @@ async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: stri
 
             // Credential Sync (Postgres only)
             if ((image.includes('postgres') || image.includes('timescale')) && pgUser && pgPwd) {
-                console.log(`[Restore] Syncing credentials for role "${pgUser}"...`);
+                console.log(`[Restore] Syncing credentials for role "${pgUser}" using explicit DB flags...`);
+                // Note: We avoid 'DROP ROLE IF EXISTS' here because if pgUser is the only superuser, 
+                // it cannot drop itself during the dump restore. We just ensure the password is correct.
                 const sqlSequence = `
                     DO $$ 
                     BEGIN 
@@ -675,25 +677,23 @@ async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: stri
                     ALTER ROLE "${pgUser.replace(/"/g, '""')}" SUPERUSER;
                 `.trim();
 
+                // Connect as the actual pgUser with its actual password, targeting 'postgres' maintenance DB
                 const syncExec = await container.exec({
-                    Cmd: ['psql', '-d', 'postgres', '-c', sqlSequence],
-                    User: 'postgres', // We try 'postgres' first as it's the internal OS user for the image
+                    Cmd: ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d 'postgres' -c "${sqlSequence.replace(/"/g, '\\"')}"`],
                     AttachStdout: true,
                     AttachStderr: true
-                }).catch(async () => {
-                    // Fallback to default user if 'postgres' OS user doesn't exist
-                    return await container.exec({
-                        Cmd: ['psql', '-d', 'postgres', '-U', pgUser!, '-c', sqlSequence],
-                        AttachStdout: true,
-                        AttachStderr: true
-                    });
                 });
 
-                await new Promise<void>((res, rej) => {
+                await new Promise<void>((res) => {
                     syncExec.start({}, (err, stream) => {
-                        if (err) return res(); // Don't fail the whole restore if sync flags an error
-                        stream?.on('end', res);
-                        stream?.on('error', () => res());
+                        if (err || !stream) return res();
+                        let output = '';
+                        stream.on('data', c => output += c.toString());
+                        stream.on('end', () => {
+                            if (output) console.log(`[Restore] Sync output: ${output.trim()}`);
+                            res();
+                        });
+                        stream.on('error', () => res());
                     });
                 });
             }
