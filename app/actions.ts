@@ -870,6 +870,17 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
             }
         }
 
+        // Strip DNS settings from services to avoid conflicts with host DNS
+        const dnsResolution = stripDnsSettings(resolvedYaml);
+        resolvedYaml = dnsResolution.yaml;
+
+        if (dnsResolution.removed.length > 0) {
+            updateJobStatus(virtualId, 'processing', `🚫 Stripping DNS settings to avoid conflicts...`);
+            for (const msg of dnsResolution.removed) {
+                console.log(`[Conflict Resolution] ${msg}`);
+            }
+        }
+
         // Import the stack configuration
         const importRes = await importStackAction(resolvedYaml, stackName);
         if (!importRes.success) {
@@ -877,7 +888,6 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
         }
 
         // 1. Ensure a clean state by stopping any existing stack with the same name
-        updateJobStatus(virtualId, 'processing', `Ensuring a clean state for "${stackName}"...`);
         try {
             const containers = await docker.listContainers({ all: true });
             const existing = containers.filter(c => c.Labels?.['com.docker.compose.project'] === stackName);
@@ -1314,11 +1324,40 @@ function resolveHealthcheckConflicts(composeYaml: string): { yaml: string; remov
                 }
             }
         }
-
         const newYaml = yaml.dump(doc, { lineWidth: -1, noRefs: true });
         return { yaml: newYaml, removed };
     } catch (error: any) {
         console.error('[Conflict Resolution] Failed to resolve healthcheck conflicts:', error);
+        return { yaml: composeYaml, removed: [] };
+    }
+}
+
+// Helper: Strip DNS settings from services to avoid conflicts with host DNS
+function stripDnsSettings(composeYaml: string): { yaml: string; removed: string[] } {
+    try {
+        const doc = yaml.load(composeYaml) as any;
+        const removed: string[] = [];
+
+        if (!doc || !doc.services) {
+            return { yaml: composeYaml, removed };
+        }
+
+        for (const [serviceName, serviceRaw] of Object.entries(doc.services as any)) {
+            const service = serviceRaw as any;
+            if (service.dns) {
+                removed.push(`dns from ${serviceName} (was: ${JSON.stringify(service.dns)})`);
+                delete service.dns;
+            }
+            if (service.dns_search) {
+                removed.push(`dns_search from ${serviceName}`);
+                delete service.dns_search;
+            }
+        }
+
+        const newYaml = yaml.dump(doc, { lineWidth: -1, noRefs: true });
+        return { yaml: newYaml, removed };
+    } catch (error: any) {
+        console.error('[Conflict Resolution] Failed to strip DNS settings:', error);
         return { yaml: composeYaml, removed: [] };
     }
 }
