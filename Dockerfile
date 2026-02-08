@@ -19,9 +19,8 @@ FROM base AS runner
 WORKDIR /app
 ENV NODE_ENV production
 
-# Install Rclone & DB Clients (for native binary usage if needed)
-# Currently using docker exec, so local binaries strictly mostly for rclone
-RUN apk add --no-cache rclone
+# Install Rclone, DB Clients, and Curl
+RUN apk add --no-cache rclone curl
 
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
