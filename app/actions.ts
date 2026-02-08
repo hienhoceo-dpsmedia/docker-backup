@@ -548,164 +548,20 @@ export async function listBackups() {
 }
 
 // Helper: Restore a single container from a Zip (used by both single and unified restore)
-async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
+// Helper to resolve ${VAR} placeholders using envMap or process.env
+function resolveEnvValue(val: string, envMap?: Record<string, string>): string {
+    if (!val) return val;
+    return val.replace(/\${([^}:-]+)(?::-([^}]*))?}/g, (_, key, defaultValue) => {
+        return envMap?.[key] || process.env[key] || defaultValue || '';
+    });
+}
+
+// Helper: Restore volumes for a container while it is STOPPED
+async function restoreVolumesInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
     const container = docker.getContainer(containerId);
 
-    // Helper to resolve ${VAR} placeholders using envMap or process.env
-    const resolveValue = (val: string): string => {
-        if (!val) return val;
-        return val.replace(/\${([^}:-]+)(?::-([^}]*))?}/g, (_, key, defaultValue) => {
-            return envMap?.[key] || process.env[key] || defaultValue || '';
-        });
-    };
+    console.log(`[Restore] Phase 0: Restoring volumes for ${containerId} while stopped...`);
 
-    // 1. Try to find config.json for this container
-    const configPath = path.join(prefix, 'config.json').replace(/\\/g, '/');
-    const configEntry = zip.getEntries().find(e => e.entryName === configPath);
-
-    if (configEntry) {
-        try {
-            const config = JSON.parse(configEntry.getData().toString('utf8'));
-            console.log(`[Restore] Restoring ${config.name} (${containerId}) from ${config.timestamp}`);
-        } catch (e) { console.warn("Failed to parse config.json", e); }
-    }
-
-    // 2. Check for SQL Dump
-    const dumpPath = path.join(prefix, 'dump.sql').replace(/\\/g, '/');
-    const dumpEntry = zip.getEntries().find(e => e.entryName === dumpPath);
-
-    if (dumpEntry) {
-        const dumpSize = dumpEntry.header.size;
-        if (dumpSize < 100) {
-            console.warn(`[Restore] SQL dump for ${containerId} is suspiciously small (${dumpSize} bytes). It might be a failed backup.`);
-            updateJobStatus(containerId, 'processing', `⚠️ Warning: SQL dump is very small (${dumpSize} bytes). Restore might be empty.`);
-        }
-        updateJobStatus(containerId, 'processing', 'Found SQL Dump. Restoring Database...');
-
-        // We need to write the dump to a temp file to stream it into the container
-        const tempDumpPath = path.join(process.cwd(), 'backups', `temp_restore_${Date.now()}.sql`);
-        fs.writeFileSync(tempDumpPath, dumpEntry.getData());
-
-        const info = await container.inspect();
-        const image = info.Config.Image;
-        let cmd: string[] = [];
-        const env = info.Config.Env || [];
-        let pgUser: string | undefined;
-        let pgPwd: string | undefined;
-        let pgDb: string | undefined;
-
-        if (image.includes('postgres') || image.includes('timescale')) {
-            pgUser = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres');
-            pgPwd = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1] || '');
-            pgDb = resolveValue(env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser);
-
-            // LOGGING FOR DEBUGGING
-            console.log(`[Restore] DB Context: User=${pgUser}, DB=${pgDb}, HasPwd=${!!pgPwd}, EnvMapKeys=${Object.keys(envMap || {}).join(',')}`);
-
-            // For PGDUMPALL restore, we SHOULD target the 'postgres' database or 'template1'
-            // because the dump contains 'CREATE DATABASE' commands for pgDb.
-            // Connecting directly to pgDb might fail if it doesn't exist yet.
-            const targetDb = 'postgres';
-            cmd = pgPwd
-                ? ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d '${targetDb}'`]
-                : ['psql', '-U', pgUser, '-d', targetDb];
-
-            console.log(`[Restore] Targeting database "${targetDb}" for full dump restoration...`);
-        } else {
-            // Mysql
-            const env = info.Config.Env || [];
-            const pwd = env.find((e: string) => e.startsWith('MYSQL_ROOT_PASSWORD='))?.split('=')[1];
-            if (pwd) {
-                cmd = ['mysql', '-u', 'root', `-p${pwd}`];
-            } else {
-                cmd = ['mysql', '-u', 'root'];
-            }
-        }
-
-        const exec = await container.exec({
-            Cmd: cmd,
-            AttachStdin: true,
-            AttachStdout: true,
-            AttachStderr: true,
-            Tty: false
-        });
-
-        await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("SQL Restore Timeout")), 300000);
-            const fileStream = fs.createReadStream(tempDumpPath);
-
-            exec.start({ hijack: true, stdin: true }, (err: any, stream: any) => {
-                if (err) { clearTimeout(timeout); return reject(err); }
-
-                let restoreOutput = '';
-                stream.on('data', (chunk: Buffer) => { restoreOutput += chunk.toString(); });
-
-                fileStream.pipe(stream);
-
-                fileStream.on('end', () => {
-                    setTimeout(() => {
-                        stream.end();
-                        clearTimeout(timeout);
-                        console.log(`[Restore] SQL Restore finished. Final output snippet: ${restoreOutput.slice(-200)}`);
-                        resolve();
-                    }, 2000); // 2s flush for large dumps
-                });
-                stream.on('error', (e: any) => { clearTimeout(timeout); reject(e); });
-            });
-        });
-
-        if ((image.includes('postgres') || image.includes('timescale')) && pgUser && pgPwd) {
-            console.log(`[Restore] Syncing Postgres password for role "${pgUser}" using ultra-robust peer authentication...`);
-            updateJobStatus(containerId, 'processing', `Syncing credentials for ${pgUser}...`);
-            try {
-                // Multi-step SQL to ensure role exists, has correct password, and superuser rights
-                const sqlSequence = `
-                    DO $$ 
-                    BEGIN 
-                        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${pgUser.replace(/'/g, "''")}') THEN 
-                            CREATE ROLE "${pgUser.replace(/"/g, '""')}" WITH LOGIN PASSWORD '${pgPwd.replace(/'/g, "''")}'; 
-                        END IF; 
-                    END $$;
-                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" WITH PASSWORD '${pgPwd.replace(/'/g, "''")}';
-                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" SUPERUSER;
-                `.trim();
-
-                const syncCmd = ['psql', '-d', 'template1', '-c', sqlSequence];
-                const syncExec = await container.exec({
-                    Cmd: syncCmd,
-                    User: 'postgres',
-                    AttachStdout: true,
-                    AttachStderr: true
-                });
-
-                await new Promise<void>((res, rej) => {
-                    syncExec.start({}, (err, stream) => {
-                        if (err) return rej(err);
-                        if (!stream) return rej(new Error("Sync execution stream not found"));
-
-                        let output = '';
-                        stream.on('data', (chunk) => { output += chunk.toString(); });
-                        stream.on('end', () => {
-                            console.log(`[Restore] Password sync output: ${output.trim()}`);
-                            if (output.toLowerCase().includes('error')) {
-                                console.warn(`[Restore] Potential error in password sync: ${output.trim()}`);
-                            }
-                            res();
-                        });
-                        stream.on('error', (e) => rej(e));
-                    });
-                });
-                console.log(`[Restore] Ultra-robust password sync finished for ${pgUser}`);
-            } catch (err: any) {
-                console.error(`[Restore] Password sync CRITICAL failure: ${err.message}`);
-            }
-        }
-
-        fs.unlinkSync(tempDumpPath);
-        updateJobStatus(containerId, 'processing', 'Database Restored.');
-    }
-
-    // 3. Restore Volumes
     const volumesPrefix = path.join(prefix, 'volumes/').replace(/\\/g, '/');
     const volumeEntries = zip.getEntries().filter(e => e.entryName.startsWith(volumesPrefix) && e.entryName.endsWith('.tar'));
 
@@ -717,15 +573,134 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
         const parentDir = path.dirname(originalPath);
 
         console.log(`[Restore] Putting volume ${entry.entryName} to ${parentDir}`);
-        updateJobStatus(containerId, 'processing', `Restoring Volume: ${originalPath}...`);
+        updateJobStatus(containerId, 'processing', `Restoring Volume (Offline): ${originalPath}...`);
 
         try {
             await container.putArchive(entry.getData(), { path: parentDir });
         } catch (err: any) {
-            console.error(`[Restore] Failed to put archive: ${err.message}`);
+            console.error(`[Restore] Failed to put archive while stopped: ${err.message}`);
             updateJobStatus(containerId, 'processing', `Warning: Failed to restore ${originalPath}`);
         }
     }
+}
+
+// Helper: Restore SQL dump for a container while it is RUNNING
+async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
+    const container = docker.getContainer(containerId);
+
+    const dumpPath = path.join(prefix, 'dump.sql').replace(/\\/g, '/');
+    const dumpEntry = zip.getEntries().find(e => e.entryName === dumpPath);
+
+    if (!dumpEntry) return;
+
+    const dumpSize = dumpEntry.header.size;
+    if (dumpSize < 100) {
+        console.warn(`[Restore] SQL dump for ${containerId} is suspiciously small (${dumpSize} bytes).`);
+        updateJobStatus(containerId, 'processing', `⚠️ Warning: SQL dump is very small (${dumpSize} bytes).`);
+    }
+
+    updateJobStatus(containerId, 'processing', 'Found SQL Dump. Restoring Database...');
+
+    const tempDumpPath = path.join(process.cwd(), 'backups', `temp_restore_${Date.now()}.sql`);
+    fs.writeFileSync(tempDumpPath, dumpEntry.getData());
+
+    try {
+        const info = await container.inspect();
+        const image = info.Config.Image.toLowerCase();
+        let cmd: string[] = [];
+        const env = info.Config.Env || [];
+        let pgUser: string | undefined;
+        let pgPwd: string | undefined;
+        let pgDb: string | undefined;
+
+        if (image.includes('postgres') || image.includes('timescale')) {
+            pgUser = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres', envMap);
+            pgPwd = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1] || '', envMap);
+            pgDb = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser || 'postgres', envMap);
+
+            const targetDb = 'postgres';
+            cmd = pgPwd
+                ? ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d '${targetDb}'`]
+                : ['psql', '-U', pgUser || 'postgres', '-d', targetDb];
+
+            console.log(`[Restore] Targeting database "${targetDb}" for SQL restore...`);
+        } else if (image.includes('mysql') || image.includes('mariadb')) {
+            const pwd = env.find((e: string) => e.startsWith('MYSQL_ROOT_PASSWORD='))?.split('=')[1];
+            cmd = pwd ? ['mysql', '-u', 'root', `-p${pwd}`] : ['mysql', '-u', 'root'];
+        }
+
+        if (cmd.length > 0) {
+            const exec = await container.exec({
+                Cmd: cmd,
+                AttachStdin: true,
+                AttachStdout: true,
+                AttachStderr: true,
+                Tty: false
+            });
+
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error("SQL Restore Timeout")), 300000);
+                const fileStream = fs.createReadStream(tempDumpPath);
+
+                exec.start({ hijack: true, stdin: true }, (err: any, stream: any) => {
+                    if (err) { clearTimeout(timeout); return reject(err); }
+
+                    let restoreOutput = '';
+                    stream.on('data', (chunk: Buffer) => { restoreOutput += chunk.toString(); });
+                    fileStream.pipe(stream);
+
+                    fileStream.on('end', () => {
+                        setTimeout(() => {
+                            stream.end();
+                            clearTimeout(timeout);
+                            console.log(`[Restore] SQL Restore finished. Output: ${restoreOutput.slice(-200)}`);
+                            resolve();
+                        }, 2000);
+                    });
+                    stream.on('error', (e: any) => { clearTimeout(timeout); reject(e); });
+                });
+            });
+
+            // Credential Sync (Postgres only)
+            if ((image.includes('postgres') || image.includes('timescale')) && pgUser && pgPwd) {
+                console.log(`[Restore] Syncing credentials for role "${pgUser}"...`);
+                const sqlSequence = `
+                    DO $$ 
+                    BEGIN 
+                        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${pgUser.replace(/'/g, "''")}') THEN 
+                            CREATE ROLE "${pgUser.replace(/"/g, '""')}" WITH LOGIN PASSWORD '${pgPwd.replace(/'/g, "''")}'; 
+                        END IF; 
+                    END $$;
+                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" WITH PASSWORD '${pgPwd.replace(/'/g, "''")}';
+                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" SUPERUSER;
+                `.trim();
+
+                const syncExec = await container.exec({
+                    Cmd: ['psql', '-d', 'template1', '-c', sqlSequence],
+                    User: 'postgres',
+                    AttachStdout: true,
+                    AttachStderr: true
+                });
+
+                await new Promise<void>((res, rej) => {
+                    syncExec.start({}, (err, stream) => {
+                        if (err) return rej(err);
+                        stream?.on('end', res);
+                        stream?.on('error', rej);
+                    });
+                });
+            }
+        }
+    } finally {
+        if (fs.existsSync(tempDumpPath)) fs.unlinkSync(tempDumpPath);
+        updateJobStatus(containerId, 'processing', 'Database Restored.');
+    }
+}
+
+// Deprecated: Please use restoreVolumesInternal and restoreSqlInternal instead
+async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
+    await restoreVolumesInternal(containerId, zip, prefix, envMap);
+    await restoreSqlInternal(containerId, zip, prefix, envMap);
 }
 
 export async function restoreBackup(filename: string, containerId: string) {
@@ -958,7 +933,25 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                 throw new Error(`Stack created but no containers found. Check docker-compose.yml syntax.`);
             }
 
-            // PHASE 2: Identify and Boot Databases
+            // PHASE 2: Restore Offline Volumes (Everything while stopped)
+            updateJobStatus(virtualId, 'processing', `📁 Phase 0: Restoring filesystem volumes (Offline)...`);
+            for (const c of targetContainers) {
+                const service = services.find((s: any) => s.service === c.Labels?.['com.docker.compose.service']);
+                if (service) {
+                    const zipPrefix = `services/${service.name}`;
+                    const hasVolumes = zip.getEntries().some(e => e.entryName.startsWith(path.join(zipPrefix, 'volumes/').replace(/\\/g, '/')));
+
+                    if (hasVolumes) {
+                        try {
+                            await restoreVolumesInternal(c.Id, zip, zipPrefix, envMap);
+                        } catch (err: any) {
+                            console.error(`[Unified Restore] Offline volume restore failed for ${c.Names[0]}:`, err);
+                        }
+                    }
+                }
+            }
+
+            // PHASE 3: Identify and Boot Databases
             const dbServices: any[] = [];
             const appServices: any[] = [];
 
@@ -980,9 +973,9 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                 else appServices.push(serviceInfo);
             }
 
-            // 2.1 Start Databases
+            // 3.1 Start Databases
             if (dbServices.length > 0) {
-                updateJobStatus(virtualId, 'processing', `⚡ Phase 1: Booting databases...`);
+                updateJobStatus(virtualId, 'processing', `⚡ Phase 1: Booting database engines...`);
                 for (const db of dbServices) {
                     console.log(`[Unified Restore] Starting database: ${db.name}`);
                     await docker.getContainer(db.containerId).start();
@@ -992,7 +985,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                 updateJobStatus(virtualId, 'processing', `⏳ Waiting for database engines to stabilize...`);
                 for (const db of dbServices) {
                     let ready = false;
-                    for (let i = 0; i < 30; i++) { // Max 30 seconds
+                    for (let i = 0; i < 30; i++) {
                         try {
                             const info = await docker.getContainer(db.containerId).inspect();
                             const image = info.Config.Image.toLowerCase();
@@ -1020,60 +1013,33 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                                 ready = true;
                                 break;
                             }
-                        } catch (e) { /* ignore and retry */ }
+                        } catch (e) { /* retry */ }
                         await new Promise(r => setTimeout(r, 1000));
                     }
-                    if (!ready) {
-                        console.warn(`[Unified Restore] Database ${db.name} failed readiness check, proceeding anyway...`);
+                    if (!ready) console.warn(`[Unified Restore] Database ${db.name} failed readiness check.`);
+                }
+            }
+
+            // PHASE 4: Restore SQL Dump and Credentials
+            updateJobStatus(virtualId, 'processing', `📦 Phase 2: Injecting database records (Online)...`);
+            for (const db of dbServices) {
+                const service = services.find((s: any) => s.service === db.serviceName);
+                if (service) {
+                    const zipPrefix = `services/${service.name}`;
+                    try {
+                        await restoreSqlInternal(db.containerId, zip, zipPrefix, envMap);
+                    } catch (err: any) {
+                        console.error(`[Unified Restore] SQL restore failed for ${db.name}:`, err);
                     }
                 }
             }
 
-            // PHASE 3: Restore Database Data
-            updateJobStatus(virtualId, 'processing', `📦 Phase 2: Injecting database records...`);
-            for (const db of dbServices) {
-                const service = services.find((s: any) => s.service === db.serviceName);
-                if (!service) continue;
-
-                updateJobStatus(virtualId, 'processing', `💾 Injecting data into ${db.name}...`);
-                try {
-                    const zipPrefix = `services/${service.name}`;
-                    await restoreContainerInternal(db.containerId, zip, zipPrefix, envMap);
-                    console.log(`[Unified Restore] ✅ Database ${db.name} restored`);
-                } catch (err: any) {
-                    console.error(`[Unified Restore] ❌ Failed to restore database ${db.name}:`, err);
-                    updateJobStatus(virtualId, 'processing', `⚠️ Warning: DB ${db.name} failed: ${err.message}`);
-                }
-            }
-
-            // PHASE 4: Start Applications
+            // PHASE 5: Start Applications
             updateJobStatus(virtualId, 'processing', `🚀 Phase 3: Powering on applications...`);
             const startCmd = tempEnvFile
                 ? `docker-compose -f "${tempComposeFile}" --env-file "${tempEnvFile}" -p ${stackName} up -d`
                 : `docker-compose -f "${tempComposeFile}" -p ${stackName} up -d`;
             await execAsync(startCmd);
-
-            // PHASE 5: Restore Application Volumes (Non-DBs)
-            updateJobStatus(virtualId, 'processing', `📁 Phase 4: Restoring application volumes...`);
-            for (const app of appServices) {
-                const service = services.find((s: any) => s.service === app.serviceName);
-                if (!service) continue;
-
-                // Check if there is data to restore (config.json or volume.tar)
-                const zipPrefix = `services/${service.name}`;
-                const hasData = zip.getEntries().some(e => e.entryName.startsWith(zipPrefix));
-
-                if (hasData) {
-                    updateJobStatus(virtualId, 'processing', `🚚 Restoring volumes for ${app.name}...`);
-                    try {
-                        await restoreContainerInternal(app.containerId, zip, zipPrefix, envMap);
-                        console.log(`[Unified Restore] ✅ Application volumes ${app.name} restored`);
-                    } catch (err: any) {
-                        console.error(`[Unified Restore] ❌ Failed to restore volumes for ${app.name}:`, err);
-                        updateJobStatus(virtualId, 'processing', `⚠️ Warning: App ${app.name} failed: ${err.message}`);
-                    }
-                }
-            }
 
         } finally {
             // Cleanup temp files
