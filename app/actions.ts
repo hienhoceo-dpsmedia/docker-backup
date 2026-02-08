@@ -1107,7 +1107,7 @@ export async function uploadBackup(formData: FormData) {
 
 // Helper: Check if a host port is in use
 async function isPortAvailable(port: number): Promise<boolean> {
-    const net = await import('node:net');
+    const net = await import('net');
 
     // 1. Check if ANY process is listening on the host
     const isFreeOnHost = await new Promise((resolve) => {
