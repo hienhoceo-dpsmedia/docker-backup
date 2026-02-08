@@ -88,6 +88,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     const [customPaths, setCustomPaths] = useState<Record<string, string>>({});
     const [showImportStack, setShowImportStack] = useState(false);
     const [yamlInput, setYamlInput] = useState('');
+    const [stackNameInput, setStackNameInput] = useState(''); // Custom stack name
     const [envFileInput, setEnvFileInput] = useState(''); // Path to .env file
 
     // Filter containers based on search
@@ -247,9 +248,10 @@ export default function DashboardClient({ initialContainers }: { initialContaine
             });
         }
 
-        const res = await importStackAction(yamlInput, undefined, envVars);
+        const res = await importStackAction(yamlInput, stackNameInput.trim() || undefined, envVars);
         if (res.success) {
             setYamlInput('');
+            setStackNameInput('');
             setEnvFileInput('');
             setShowImportStack(false);
             refreshData();
@@ -835,13 +837,30 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                     <XCircle className="w-6 h-6" />
                                 </button>
                             </div>
-                            <div className="p-8">
-                                <textarea
-                                    className="w-full h-80 bg-slate-950 border border-slate-800 rounded-2xl p-6 font-mono text-sm text-blue-300 focus:ring-2 focus:ring-blue-500 outline-none transition-all placeholder:text-slate-700"
-                                    placeholder="version: '3.8'&#10;services:&#10;  app:&#10;    image: custom-image&#10;    volumes:&#10;      - ./data:/app/data"
-                                    value={yamlInput}
-                                    onChange={(e) => setYamlInput(e.target.value)}
-                                />
+                            <div className="p-8 space-y-6">
+                                <div>
+                                    <label className="block text-sm font-semibold text-white mb-2">
+                                        Stack Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        className="w-full bg-slate-950 border border-slate-800 rounded-2xl p-4 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all placeholder:text-slate-700"
+                                        placeholder="e.g. my-app-production (optional)"
+                                        value={stackNameInput}
+                                        onChange={(e) => setStackNameInput(e.target.value)}
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-semibold text-white mb-2">
+                                        Compose YAML
+                                    </label>
+                                    <textarea
+                                        className="w-full h-80 bg-slate-950 border border-slate-800 rounded-2xl p-6 font-mono text-sm text-blue-300 focus:ring-2 focus:ring-blue-500 outline-none transition-all placeholder:text-slate-700"
+                                        placeholder="version: '3.8'&#10;services:&#10;  app:&#10;    image: custom-image&#10;    volumes:&#10;      - ./data:/app/data"
+                                        value={yamlInput}
+                                        onChange={(e) => setYamlInput(e.target.value)}
+                                    />
+                                </div>
 
                                 <div className="mt-6">
                                     <label className="block text-sm font-semibold text-white mb-2">
@@ -873,10 +892,11 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                 </div>
                             </div>
                         </div>
-                    </div>
-                )}
-            </main>
-        </div>
+                    </div >
+                )
+                }
+            </main >
+        </div >
     );
 }
 

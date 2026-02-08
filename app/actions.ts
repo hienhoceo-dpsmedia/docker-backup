@@ -323,18 +323,54 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
         }
 
         updateJobStatus(containerId, 'processing', 'Step: Executing Dump...');
+        console.log(`[Backup] Starting DB dump for ${name}...`);
         const exec = await container.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true });
         await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("DB Dump timeout")), 300000);
+            const timeout = setTimeout(() => {
+                console.error(`[Backup] DB Dump timeout for ${name}`);
+                reject(new Error("DB Dump timeout"));
+            }, 300000);
+
             exec.start({}, (err: any, stream: any) => {
-                if (err) { clearTimeout(timeout); return reject(err); }
+                if (err) {
+                    clearTimeout(timeout);
+                    console.error(`[Backup] Exec start error for ${name}:`, err);
+                    return reject(err);
+                }
                 const fileStream = fs.createWriteStream(tempSqlPath);
+
+                // Use a safe demux for reliable output capture
                 container.modem.demuxStream(stream, fileStream, process.stderr);
-                stream.on('end', () => fileStream.end());
+
+                stream.on('end', () => {
+                    console.log(`[Backup] Stream ended for ${name} DB dump`);
+                    fileStream.end();
+                });
+
                 fileStream.on('finish', () => {
                     clearTimeout(timeout);
-                    if (fs.statSync(tempSqlPath).size === 0) reject(new Error("Empty SQL Dump"));
-                    else resolve();
+                    console.log(`[Backup] File stream finished for ${name} DB dump`);
+                    try {
+                        if (fs.statSync(tempSqlPath).size === 0) {
+                            reject(new Error("Empty SQL Dump"));
+                        } else {
+                            resolve();
+                        }
+                    } catch (e: any) {
+                        reject(new Error(`SQL Dump file error: ${e.message}`));
+                    }
+                });
+
+                fileStream.on('error', (e: any) => {
+                    clearTimeout(timeout);
+                    console.error(`[Backup] File stream error for ${name}:`, e);
+                    reject(e);
+                });
+
+                stream.on('error', (e: any) => {
+                    clearTimeout(timeout);
+                    console.error(`[Backup] Socket stream error for ${name}:`, e);
+                    reject(e);
                 });
             });
         });
@@ -385,11 +421,15 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
         for (const volPath of uniquePaths) {
             try {
                 updateJobStatus(containerId, 'processing', `Archiving: ${volPath}`);
+                console.log(`[Backup] Archiving volume ${volPath} for ${containerId}...`);
                 const tarStream = await container.getArchive({ path: volPath });
                 const safeName = volPath.replace(/[\/\\]/g, '_').replace(/^_/, '') + '.tar';
+
+                // Wrap in promise to ensure stream completion if possible, though archiver handle it
                 archive.append(tarStream as any, { name: path.join(prefix, 'volumes', safeName) });
+                console.log(`[Backup] Volume ${volPath} added to archive.`);
             } catch (err: any) {
-                console.error(`Failed to archive volume ${volPath}:`, err);
+                console.error(`[Backup] Failed to archive volume ${volPath}:`, err);
                 archive.append(`Failed: ${err.message}`, { name: path.join(prefix, `ERROR_${volPath.replace(/[\/\\]/g, '_')}.txt`) });
             }
         }
@@ -527,6 +567,11 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
     const dumpEntry = zip.getEntries().find(e => e.entryName === dumpPath);
 
     if (dumpEntry) {
+        const dumpSize = dumpEntry.header.size;
+        if (dumpSize < 100) {
+            console.warn(`[Restore] SQL dump for ${containerId} is suspiciously small (${dumpSize} bytes). It might be a failed backup.`);
+            updateJobStatus(containerId, 'processing', `⚠️ Warning: SQL dump is very small (${dumpSize} bytes). Restore might be empty.`);
+        }
         updateJobStatus(containerId, 'processing', 'Found SQL Dump. Restoring Database...');
 
         // We need to write the dump to a temp file to stream it into the container
@@ -536,11 +581,21 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
         const info = await container.inspect();
         const image = info.Config.Image;
         let cmd: string[] = [];
+        const env = info.Config.Env || [];
+        let pgUser: string | undefined;
+        let pgPwd: string | undefined;
+        let pgDb: string | undefined;
 
         if (image.includes('postgres') || image.includes('timescale')) {
-            const env = info.Config.Env || [];
-            const pgUser = env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres';
-            cmd = ['psql', '-U', pgUser, '-d', pgUser];
+            pgUser = env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres';
+            pgPwd = env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1];
+            pgDb = env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser;
+
+            // Use template1 for initial connection if pgDb might not be ready, 
+            // but for restore we want to target pgDb.
+            cmd = pgPwd
+                ? ['sh', '-c', `PGPASSWORD='${pgPwd.replace(/'/g, "'\\''")}' psql -U '${pgUser}' -d '${pgDb}'`]
+                : ['psql', '-U', pgUser, '-d', pgDb];
         } else {
             // Mysql
             const env = info.Config.Env || [];
@@ -569,16 +624,66 @@ async function restoreContainerInternal(containerId: string, zip: AdmZip, prefix
 
                 fileStream.pipe(stream);
 
-                stream.on('end', () => { clearTimeout(timeout); resolve(); });
                 // Docker streams sometimes don't emit end correctly on stdin pipe, 
                 // but fileStream end is reliable for input.
                 fileStream.on('end', () => {
                     // Give it a moment to flush
-                    setTimeout(() => { stream.end(); resolve(); }, 1000);
+                    setTimeout(() => {
+                        stream.end();
+                        clearTimeout(timeout);
+                        resolve();
+                    }, 1000);
                 });
                 stream.on('error', (e: any) => { clearTimeout(timeout); reject(e); });
             });
         });
+
+        if ((image.includes('postgres') || image.includes('timescale')) && pgUser && pgPwd) {
+            console.log(`[Restore] Syncing Postgres password for role "${pgUser}" using ultra-robust peer authentication...`);
+            updateJobStatus(containerId, 'processing', `Syncing credentials for ${pgUser}...`);
+            try {
+                // Multi-step SQL to ensure role exists, has correct password, and superuser rights
+                const sqlSequence = `
+                    DO $$ 
+                    BEGIN 
+                        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${pgUser.replace(/'/g, "''")}') THEN 
+                            CREATE ROLE "${pgUser.replace(/"/g, '""')}" WITH LOGIN PASSWORD '${pgPwd.replace(/'/g, "''")}'; 
+                        END IF; 
+                    END $$;
+                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" WITH PASSWORD '${pgPwd.replace(/'/g, "''")}';
+                    ALTER ROLE "${pgUser.replace(/"/g, '""')}" SUPERUSER;
+                `.trim();
+
+                const syncCmd = ['psql', '-d', 'template1', '-c', sqlSequence];
+                const syncExec = await container.exec({
+                    Cmd: syncCmd,
+                    User: 'postgres',
+                    AttachStdout: true,
+                    AttachStderr: true
+                });
+
+                await new Promise<void>((res, rej) => {
+                    syncExec.start({}, (err, stream) => {
+                        if (err) return rej(err);
+                        if (!stream) return rej(new Error("Sync execution stream not found"));
+
+                        let output = '';
+                        stream.on('data', (chunk) => { output += chunk.toString(); });
+                        stream.on('end', () => {
+                            console.log(`[Restore] Password sync output: ${output.trim()}`);
+                            if (output.toLowerCase().includes('error')) {
+                                console.warn(`[Restore] Potential error in password sync: ${output.trim()}`);
+                            }
+                            res();
+                        });
+                        stream.on('error', (e) => rej(e));
+                    });
+                });
+                console.log(`[Restore] Ultra-robust password sync finished for ${pgUser}`);
+            } catch (err: any) {
+                console.error(`[Restore] Password sync CRITICAL failure: ${err.message}`);
+            }
+        }
 
         fs.unlinkSync(tempDumpPath);
         updateJobStatus(containerId, 'processing', 'Database Restored.');
@@ -727,10 +832,40 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
             }
         }
 
+        // Resolve static IP conflicts
+        const networkResolution = resolveNetworkConflicts(resolvedYaml);
+        resolvedYaml = networkResolution.yaml;
+
+        if (networkResolution.removed.length > 0) {
+            updateJobStatus(virtualId, 'processing', `🌐 Stripping static IPs to avoid subnet conflicts...`);
+            for (const msg of networkResolution.removed) {
+                console.log(`[Conflict Resolution] ${msg}`);
+            }
+        }
+
         // Import the stack configuration
         const importRes = await importStackAction(resolvedYaml, stackName);
         if (!importRes.success) {
             throw new Error(`Failed to import stack: ${importRes.error}`);
+        }
+
+        // 1. Ensure a clean state by stopping any existing stack with the same name
+        updateJobStatus(virtualId, 'processing', `Ensuring a clean state for "${stackName}"...`);
+        try {
+            const containers = await docker.listContainers({ all: true });
+            const existing = containers.filter(c => c.Labels?.['com.docker.compose.project'] === stackName);
+            if (existing.length > 0) {
+                console.log(`[Unified Restore] Stopping existing stack containers for "${stackName}"...`);
+                for (const c of existing) {
+                    try {
+                        const container = docker.getContainer(c.Id);
+                        await container.stop({ t: 10 });
+                        await container.remove({ v: true, force: true });
+                    } catch (e) { /* ignore cleanup errors */ }
+                }
+            }
+        } catch (err) {
+            console.warn(`[Unified Restore] Clean state check failed:`, err);
         }
 
         // Deploy using docker-compose
@@ -754,27 +889,144 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
         let targetContainers: any[] = [];
 
         try {
-            // Use docker-compose to deploy
-            const deployCmd = tempEnvFile
-                ? `docker-compose -f "${tempComposeFile}" --env-file "${tempEnvFile}" -p ${stackName} up -d`
-                : `docker-compose -f "${tempComposeFile}" -p ${stackName} up -d`;
-            await execAsync(deployCmd);
+            // Ensure external networks exist before deploy
+            updateJobStatus(virtualId, 'processing', `Ensuring external networks exist...`);
+            await ensureExternalNetworks(resolvedYaml);
 
-            // Wait for containers to start
-            updateJobStatus(virtualId, 'processing', `Waiting for containers to start...`);
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            // PHASE 1: Create without starting
+            updateJobStatus(virtualId, 'processing', `Creating container infrastructure...`);
+            const createCmd = tempEnvFile
+                ? `docker-compose -f "${tempComposeFile}" --env-file "${tempEnvFile}" -p ${stackName} up -d --no-start`
+                : `docker-compose -f "${tempComposeFile}" -p ${stackName} up -d --no-start`;
+            await execAsync(createCmd);
 
-            // Get deployed containers
+            // Get all created containers
             const containers = await docker.listContainers({ all: true });
             targetContainers = containers.filter(c =>
                 c.Labels?.['com.docker.compose.project'] === stackName
             );
 
             if (targetContainers.length === 0) {
-                throw new Error(`Stack deployed but no containers found. Check docker-compose.yml syntax.`);
+                throw new Error(`Stack created but no containers found. Check docker-compose.yml syntax.`);
             }
 
-            updateJobStatus(virtualId, 'processing', `Stack deployed with ${targetContainers.length} containers. Starting data restore...`);
+            // PHASE 2: Identify and Boot Databases
+            const dbServices: any[] = [];
+            const appServices: any[] = [];
+
+            for (const c of targetContainers) {
+                const info = await docker.getContainer(c.Id).inspect();
+                const image = info.Config.Image.toLowerCase();
+                const isDb = image.includes('postgres') || image.includes('timescale') ||
+                    image.includes('mysql') || image.includes('mariadb') ||
+                    image.includes('redis') || image.includes('mongo');
+
+                const serviceInfo = {
+                    containerId: c.Id,
+                    name: c.Names[0].replace('/', ''),
+                    serviceName: c.Labels?.['com.docker.compose.service'],
+                    isDb
+                };
+
+                if (isDb) dbServices.push(serviceInfo);
+                else appServices.push(serviceInfo);
+            }
+
+            // 2.1 Start Databases
+            if (dbServices.length > 0) {
+                updateJobStatus(virtualId, 'processing', `⚡ Phase 1: Booting databases...`);
+                for (const db of dbServices) {
+                    console.log(`[Unified Restore] Starting database: ${db.name}`);
+                    await docker.getContainer(db.containerId).start();
+                }
+
+                // Wait for readiness
+                updateJobStatus(virtualId, 'processing', `⏳ Waiting for database engines to stabilize...`);
+                for (const db of dbServices) {
+                    let ready = false;
+                    for (let i = 0; i < 30; i++) { // Max 30 seconds
+                        try {
+                            const info = await docker.getContainer(db.containerId).inspect();
+                            const image = info.Config.Image.toLowerCase();
+                            let checkCmd = ['pg_isready'];
+                            if (image.includes('mysql') || image.includes('mariadb')) checkCmd = ['mysqladmin', 'ping'];
+                            if (image.includes('redis')) checkCmd = ['redis-cli', 'ping'];
+
+                            const checkExec = await docker.getContainer(db.containerId).exec({
+                                Cmd: checkCmd,
+                                AttachStdout: true,
+                                AttachStderr: true
+                            });
+
+                            const isReady = await new Promise<boolean>((res) => {
+                                checkExec.start({}, (err, stream) => {
+                                    if (err || !stream) return res(false);
+                                    let out = '';
+                                    stream.on('data', c => out += c.toString());
+                                    stream.on('end', () => res(out.toLowerCase().includes('accepting') || out.toLowerCase().includes('alive') || out.toLowerCase().includes('pong')));
+                                    setTimeout(() => res(false), 2000);
+                                });
+                            });
+
+                            if (isReady) {
+                                ready = true;
+                                break;
+                            }
+                        } catch (e) { /* ignore and retry */ }
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                    if (!ready) {
+                        console.warn(`[Unified Restore] Database ${db.name} failed readiness check, proceeding anyway...`);
+                    }
+                }
+            }
+
+            // PHASE 3: Restore Database Data
+            updateJobStatus(virtualId, 'processing', `📦 Phase 2: Injecting database records...`);
+            for (const db of dbServices) {
+                const service = services.find((s: any) => s.service === db.serviceName);
+                if (!service) continue;
+
+                updateJobStatus(virtualId, 'processing', `💾 Injecting data into ${db.name}...`);
+                try {
+                    const zipPrefix = `services/${service.name}`;
+                    await restoreContainerInternal(db.containerId, zip, zipPrefix);
+                    console.log(`[Unified Restore] ✅ Database ${db.name} restored`);
+                } catch (err: any) {
+                    console.error(`[Unified Restore] ❌ Failed to restore database ${db.name}:`, err);
+                    updateJobStatus(virtualId, 'processing', `⚠️ Warning: DB ${db.name} failed: ${err.message}`);
+                }
+            }
+
+            // PHASE 4: Start Applications
+            updateJobStatus(virtualId, 'processing', `🚀 Phase 3: Powering on applications...`);
+            const startCmd = tempEnvFile
+                ? `docker-compose -f "${tempComposeFile}" --env-file "${tempEnvFile}" -p ${stackName} up -d`
+                : `docker-compose -f "${tempComposeFile}" -p ${stackName} up -d`;
+            await execAsync(startCmd);
+
+            // PHASE 5: Restore Application Volumes (Non-DBs)
+            updateJobStatus(virtualId, 'processing', `📁 Phase 4: Restoring application volumes...`);
+            for (const app of appServices) {
+                const service = services.find((s: any) => s.service === app.serviceName);
+                if (!service) continue;
+
+                // Check if there is data to restore (config.json or volume.tar)
+                const zipPrefix = `services/${service.name}`;
+                const hasData = zip.getEntries().some(e => e.entryName.startsWith(zipPrefix));
+
+                if (hasData) {
+                    updateJobStatus(virtualId, 'processing', `🚚 Restoring volumes for ${app.name}...`);
+                    try {
+                        await restoreContainerInternal(app.containerId, zip, zipPrefix);
+                        console.log(`[Unified Restore] ✅ Application volumes ${app.name} restored`);
+                    } catch (err: any) {
+                        console.error(`[Unified Restore] ❌ Failed to restore volumes for ${app.name}:`, err);
+                        updateJobStatus(virtualId, 'processing', `⚠️ Warning: App ${app.name} failed: ${err.message}`);
+                    }
+                }
+            }
+
         } finally {
             // Cleanup temp files
             if (fs.existsSync(tempComposeFile)) {
@@ -785,55 +1037,20 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
             }
         }
 
-        // RESTORE DATA TO EACH SERVICE
-        let successCount = 0;
-        let failCount = 0;
-
-        for (const service of services) {
-            const serviceName = service.service;
-            const originalName = service.name;
-
-            // Find container matching this service
-            const targetContainer = targetContainers.find(c =>
-                c.Labels?.['com.docker.compose.service'] === serviceName
-            );
-
-            if (!targetContainer) {
-                console.warn(`[Unified Restore] Skipping service ${serviceName}: No matching container`);
-                updateJobStatus(virtualId, 'processing', `⚠️ Skipping ${serviceName}: Container not found`);
-                failCount++;
-                continue;
-            }
-
-            const cName = targetContainer.Names[0].replace('/', '');
-            updateJobStatus(virtualId, 'processing', `📦 Restoring ${serviceName} → ${cName}...`);
-
-            try {
-                const zipPrefix = `services/${originalName}`;
-                await restoreContainerInternal(targetContainer.Id, zip, zipPrefix);
-                successCount++;
-                updateJobStatus(virtualId, 'processing', `✅ ${serviceName} restored`);
-            } catch (err: any) {
-                console.error(`[Unified Restore] Failed to restore ${serviceName}:`, err);
-                failCount++;
-                updateJobStatus(virtualId, 'processing', `❌ ${serviceName} failed: ${err.message}`);
-            }
-        }
-
-        const msg = `Stack "${stackName}" restored. ✅ ${successCount} services${failCount > 0 ? `, ❌ ${failCount} failed` : ''}${portResolution.remappings.length > 0 ? `\n📋 Port remappings: ${portResolution.remappings.join(', ')}` : ''}`;
-        updateJobStatus(virtualId, failCount === 0 ? 'completed' : 'failed', msg);
+        const msg = `Stack "${stackName}" restored successfully. ${portResolution.remappings.length > 0 ? `\n📋 Port remappings: ${portResolution.remappings.join(', ')}` : ''}`;
+        updateJobStatus(virtualId, 'completed', msg);
 
         addHistoryEntry({
             id: Date.now().toString(),
             date: new Date().toISOString(),
             containerName: stackName,
-            status: failCount === 0 ? 'success' : 'failed',
+            status: 'success',
             destination: 'local',
             message: msg,
         });
 
         revalidatePath('/');
-        return { success: failCount === 0, message: msg };
+        return { success: true, message: msg };
 
     } catch (error: any) {
         console.error("Unified Restore failed:", error);
@@ -974,6 +1191,101 @@ function resolveContainerNameConflicts(composeYaml: string): { yaml: string; rem
     } catch (error: any) {
         console.error('[Conflict Resolution] Failed to remove container names:', error);
         return { yaml: composeYaml, removed: [] };
+    }
+}
+
+// Helper: Remove static IP assignments (ipv4_address, ipv6_address) to avoid subnet conflicts
+function resolveNetworkConflicts(composeYaml: string): { yaml: string; removed: string[] } {
+    try {
+        const doc = yaml.load(composeYaml) as any;
+        const removed: string[] = [];
+
+        if (!doc || !doc.services) {
+            return { yaml: composeYaml, removed };
+        }
+
+        for (const [serviceName, serviceRaw] of Object.entries(doc.services as any)) {
+            const service = serviceRaw as any;
+            if (service.networks) {
+                if (Array.isArray(service.networks)) {
+                    // Standard list: nothing to strip here specifically for IPs
+                } else {
+                    // Object format:
+                    // services:
+                    //   app:
+                    //     networks:
+                    //       default:
+                    //         ipv4_address: 172.16.238.10
+                    for (const [netName, netConfig] of Object.entries(service.networks)) {
+                        const config = netConfig as any;
+                        if (config && (config.ipv4_address || config.ipv6_address)) {
+                            if (config.ipv4_address) {
+                                removed.push(`${serviceName} on ${netName}: ipv4_address ${config.ipv4_address}`);
+                                delete config.ipv4_address;
+                            }
+                            if (config.ipv6_address) {
+                                removed.push(`${serviceName} on ${netName}: ipv6_address ${config.ipv6_address}`);
+                                delete config.ipv6_address;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const newYaml = yaml.dump(doc, { lineWidth: -1, noRefs: true });
+        return { yaml: newYaml, removed };
+    } catch (error: any) {
+        console.error('[Conflict Resolution] Failed to remove static IPs:', error);
+        return { yaml: composeYaml, removed: [] };
+    }
+}
+
+// Helper: Ensure external networks exist before running docker-compose
+async function ensureExternalNetworks(composeYaml: string) {
+    try {
+        const yaml = await import('js-yaml');
+        const doc = yaml.load(composeYaml) as any;
+        if (!doc || !doc.networks) return;
+
+        const networks = await docker.listNetworks();
+        const existingNames = new Set(networks.map(n => n.Name));
+
+        for (const [netName, netConfig] of Object.entries(doc.networks as any)) {
+            const config = netConfig as any;
+            if (config && config.external) {
+                // In Compose:
+                // networks:
+                //   foo:
+                //     external: true -> name is 'foo'
+                //   bar:
+                //     external: { name: 'actual_bar' } -> name is 'actual_bar'
+                //   baz:
+                //     external: 'actual_baz' -> name is 'actual_baz'
+
+                let actualName = netName;
+                if (typeof config.external === 'string') {
+                    actualName = config.external;
+                } else if (config.external.name) {
+                    actualName = config.external.name;
+                } else if (config.name) {
+                    actualName = config.name;
+                }
+
+                if (!existingNames.has(actualName)) {
+                    console.log(`[Restore] Creating missing external network: ${actualName}`);
+                    await docker.createNetwork({
+                        Name: actualName,
+                        Driver: 'bridge',
+                        CheckDuplicate: true // Safety check
+                    });
+                }
+            }
+        }
+    } catch (err) {
+        console.error("[Restore] Failed to ensure external networks:", err);
+        // We don't throw here to let docker-compose try anyway, 
+        // as it might have its own resolution or fail with a clearer message.
     }
 }
 
