@@ -676,17 +676,24 @@ async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: stri
                 `.trim();
 
                 const syncExec = await container.exec({
-                    Cmd: ['psql', '-d', 'template1', '-c', sqlSequence],
-                    User: 'postgres',
+                    Cmd: ['psql', '-d', 'postgres', '-c', sqlSequence],
+                    User: 'postgres', // We try 'postgres' first as it's the internal OS user for the image
                     AttachStdout: true,
                     AttachStderr: true
+                }).catch(async () => {
+                    // Fallback to default user if 'postgres' OS user doesn't exist
+                    return await container.exec({
+                        Cmd: ['psql', '-d', 'postgres', '-U', pgUser!, '-c', sqlSequence],
+                        AttachStdout: true,
+                        AttachStderr: true
+                    });
                 });
 
                 await new Promise<void>((res, rej) => {
                     syncExec.start({}, (err, stream) => {
-                        if (err) return rej(err);
+                        if (err) return res(); // Don't fail the whole restore if sync flags an error
                         stream?.on('end', res);
-                        stream?.on('error', rej);
+                        stream?.on('error', () => res());
                     });
                 });
             }
@@ -989,7 +996,13 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                         try {
                             const info = await docker.getContainer(db.containerId).inspect();
                             const image = info.Config.Image.toLowerCase();
+                            const env = info.Config.Env || [];
+
                             let checkCmd = ['pg_isready'];
+                            if (image.includes('postgres') || image.includes('timescale')) {
+                                const pgUser = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres', envMap);
+                                checkCmd = ['pg_isready', '-U', pgUser];
+                            }
                             if (image.includes('mysql') || image.includes('mariadb')) checkCmd = ['mysqladmin', 'ping'];
                             if (image.includes('redis')) checkCmd = ['redis-cli', 'ping'];
 
