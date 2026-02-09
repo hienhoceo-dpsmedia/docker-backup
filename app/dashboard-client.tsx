@@ -103,6 +103,20 @@ export default function DashboardClient({ initialContainers }: { initialContaine
         c.Image.toLowerCase().includes(searchQuery.toLowerCase())
     );
 
+    // Live Mode State with Persistence
+    const [isLive, setIsLive] = useState(true);
+
+    useEffect(() => {
+        const saved = localStorage.getItem('backup_is_live');
+        if (saved !== null) {
+            setIsLive(saved === 'true');
+        }
+    }, []);
+
+    useEffect(() => {
+        localStorage.setItem('backup_is_live', String(isLive));
+    }, [isLive]);
+
     const refreshData = async () => {
         setIsRefreshing(true);
         try {
@@ -123,15 +137,22 @@ export default function DashboardClient({ initialContainers }: { initialContaine
         }
     };
 
-    // Polling for progress
+    // Polling for progress (Only when Live)
     useEffect(() => {
-        refreshData();
+        refreshData(); // Initial load
+    }, []);
+
+    useEffect(() => {
+        if (!isLive) return;
+
+        refreshData(); // Refresh on toggle ON
         const timer = setInterval(async () => {
             const p = await getProgress();
             setProgress(p);
+            // Optional: Full refresh every X intervals if needed, but progress is main thing
         }, 2000);
         return () => clearInterval(timer);
-    }, []);
+    }, [isLive]);
 
     const handleBackup = async (ids: string[]) => {
         const pathsMap: Record<string, string[]> = {};
@@ -453,6 +474,19 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                             <p className="text-slate-400">Manage your infrastructure backups with confidence.</p>
                         </div>
                         <div className="flex items-center gap-4">
+                            <button
+                                onClick={() => setIsLive(!isLive)}
+                                className={cn(
+                                    "flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-bold transition-all border",
+                                    isLive
+                                        ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20 hover:bg-emerald-500/20"
+                                        : "bg-slate-800/50 text-slate-500 border-slate-700 hover:text-slate-300"
+                                )}
+                                title={isLive ? "Pause Live Updates" : "Resume Live Updates"}
+                            >
+                                <div className={cn("w-2 h-2 rounded-full transition-all", isLive ? "bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-slate-500")} />
+                                {isLive ? 'LIVE' : 'PAUSED'}
+                            </button>
                             <button
                                 onClick={refreshData}
                                 className={cn(
