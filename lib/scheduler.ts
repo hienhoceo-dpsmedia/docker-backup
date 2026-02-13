@@ -1,6 +1,7 @@
 import cron, { ScheduledTask } from 'node-cron';
 import { getSettings, ScheduleConfig } from './storage';
 import { triggerBackup, triggerUnifiedStackBackup } from '@/app/actions';
+import { backupQueue } from './queue';
 
 // We need to track multiple tasks
 let scheduledTasks: Record<string, ScheduledTask> = {};
@@ -37,8 +38,10 @@ export function initScheduler() {
         if (cronExpression) {
             console.log(`[Scheduler] Stack ${stackName}: ${config.frequency} (Cron: ${cronExpression})`);
             const task = cron.schedule(cronExpression, async () => {
-                console.log(`[Scheduler] Triggering UNIFIED stack backup for ${stackName}`);
-                await triggerUnifiedStackBackup(stackName);
+                console.log(`[Scheduler] Triggering UNIFIED stack backup for ${stackName} (via queue)`);
+                backupQueue.add(async () => {
+                    await triggerUnifiedStackBackup(stackName);
+                });
             });
             scheduledTasks[`stack-${stackName}`] = task;
         }
