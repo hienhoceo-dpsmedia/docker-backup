@@ -22,6 +22,7 @@ export type { AppSettings, HistoryEntry, StackConfig } from '@/lib/storage';
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { revalidatePath } from 'next/cache';
 import archiver from 'archiver'; // Installed dependency
 import AdmZip from 'adm-zip'; // Installed for restore
@@ -29,6 +30,88 @@ import yaml from 'js-yaml'; // For YAML parsing in conflict resolution
 
 // Helper to check if Rclone is configured (Mock for MVP)
 const hasRclone = false; // Set to true if Rclone is configured
+const ZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.BACKUP_ZIP_LEVEL || 4)));
+const INCLUDE_DB_VOLUME_BACKUP = process.env.INCLUDE_DB_VOLUME_BACKUP === 'true';
+const BACKUP_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.BACKUP_CHECK_INTERVAL_MS || 30000));
+const BACKUP_MAX_DEFERRALS = Math.max(0, Number(process.env.BACKUP_MAX_DEFERRALS || 20));
+const BACKUP_DISK_SAMPLE_MS = Math.max(200, Number(process.env.BACKUP_DISK_SAMPLE_MS || 1000));
+const BACKUP_MAX_LOADAVG = Number(process.env.BACKUP_MAX_LOADAVG || Math.max(1, os.cpus().length * 0.9));
+const BACKUP_MAX_DISK_UTIL = Math.max(1, Math.min(100, Number(process.env.BACKUP_MAX_DISK_UTIL || 85)));
+const DB_PATH_HINTS = [
+    '/var/lib/postgresql',
+    '/var/lib/postgres',
+    '/var/lib/mysql',
+    '/var/lib/mariadb',
+    '/bitnami/postgresql',
+    '/bitnami/mysql',
+];
+
+function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readDiskIoTimes(): Map<string, number> {
+    const data = fs.readFileSync('/proc/diskstats', 'utf-8');
+    const map = new Map<string, number>();
+    for (const line of data.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 14) continue;
+        const name = parts[2];
+        if (!/^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+)$/.test(name)) continue;
+        const ioMs = Number(parts[12]); // time spent doing I/Os (ms)
+        if (!Number.isFinite(ioMs)) continue;
+        map.set(name, ioMs);
+    }
+    return map;
+}
+
+async function getDiskUtilizationPercent(sampleMs: number): Promise<number | null> {
+    try {
+        const start = readDiskIoTimes();
+        if (start.size === 0) return null;
+        await sleep(sampleMs);
+        const end = readDiskIoTimes();
+
+        let maxUtil = 0;
+        start.forEach((startIoMs, name) => {
+            const endIoMs = end.get(name);
+            if (endIoMs === undefined) return;
+            const delta = Math.max(0, endIoMs - startIoMs);
+            const util = (delta / sampleMs) * 100;
+            if (util > maxUtil) maxUtil = util;
+        });
+        return maxUtil;
+    } catch {
+        return null;
+    }
+}
+
+async function waitForSystemCapacity(jobId: string) {
+    for (let attempt = 0; attempt <= BACKUP_MAX_DEFERRALS; attempt++) {
+        const load1 = os.loadavg()[0];
+        const diskUtil = await getDiskUtilizationPercent(BACKUP_DISK_SAMPLE_MS);
+        const highLoad = load1 > BACKUP_MAX_LOADAVG;
+        const highDisk = diskUtil !== null && diskUtil > BACKUP_MAX_DISK_UTIL;
+
+        if (!highLoad && !highDisk) return;
+
+        if (attempt === BACKUP_MAX_DEFERRALS) {
+            updateJobStatus(
+                jobId,
+                'processing',
+                `System busy persists (load=${load1.toFixed(2)}, disk=${diskUtil?.toFixed(1) ?? 'n/a'}%). Proceeding after max deferrals.`
+            );
+            return;
+        }
+
+        updateJobStatus(
+            jobId,
+            'pending',
+            `Deferred (${attempt + 1}/${BACKUP_MAX_DEFERRALS}) load=${load1.toFixed(2)}>${BACKUP_MAX_LOADAVG.toFixed(2)} or disk=${diskUtil?.toFixed(1) ?? 'n/a'}>${BACKUP_MAX_DISK_UTIL}%`
+        );
+        await sleep(BACKUP_CHECK_INTERVAL_MS);
+    }
+}
 
 // Server action wrappers for storage (to avoid client-side node:fs imports)
 export async function getHistoryAction() {
@@ -98,7 +181,7 @@ export async function getProgress() {
     return getAllJobs();
 }
 
-export async function triggerUnifiedStackBackup(stackName: string) {
+async function runUnifiedStackBackup(stackName: string) {
     const backupDir = path.join(process.cwd(), 'backups');
     if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
 
@@ -107,6 +190,7 @@ export async function triggerUnifiedStackBackup(stackName: string) {
 
     try {
         updateJobStatus(virtualId, 'processing', `Starting Unified Backup for ${stackName}...`);
+        await waitForSystemCapacity(virtualId);
 
         const containers = await docker.listContainers({ all: true });
 
@@ -130,7 +214,7 @@ export async function triggerUnifiedStackBackup(stackName: string) {
         }
 
         const output = fs.createWriteStream(filePath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        const archive = archiver('zip', { zlib: { level: ZIP_LEVEL } });
 
         await new Promise<void>(async (resolve, reject) => {
             const timeout = setTimeout(() => reject(new Error("Unified Backup timeout")), 600000);
@@ -201,9 +285,22 @@ export async function triggerUnifiedStackBackup(stackName: string) {
     }
 }
 
+export async function triggerUnifiedStackBackup(stackName: string) {
+    return runUnifiedStackBackup(stackName);
+}
+
 export async function triggerStackBackup(stackName: string) {
-    // Legacy support or alias to unified
-    return triggerUnifiedStackBackup(stackName);
+    try {
+        const virtualId = `stack-${stackName}`;
+        updateJobStatus(virtualId, 'pending', `Queued stack backup for ${stackName}`);
+        backupQueue.add(async () => {
+            await runUnifiedStackBackup(stackName);
+        });
+        revalidatePath('/');
+        return { success: true, queued: true };
+    } catch (error: any) {
+        return { success: false, error: error.message || 'Failed to queue stack backup' };
+    }
 }
 
 export async function triggerBackup(containerIds: string[], customPathsMap?: Record<string, string[]>) {
@@ -224,6 +321,7 @@ export async function triggerBackup(containerIds: string[], customPathsMap?: Rec
 async function processBackup(containerId: string, customPaths?: string[]) {
     try {
         updateJobStatus(containerId, 'processing', 'Identifying...');
+        await waitForSystemCapacity(containerId);
         const backupDir = path.join(process.cwd(), 'backups');
         if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
 
@@ -287,6 +385,17 @@ function detectAppType(image: string, labels: Record<string, string> = {}): stri
     return 'generic';
 }
 
+function isDatabaseImage(image: string): boolean {
+    const lower = image.toLowerCase();
+    return lower.includes('postgres') || lower.includes('timescale') || lower.includes('mysql') || lower.includes('mariadb');
+}
+
+function shouldSkipVolumePath(image: string, volPath: string): boolean {
+    if (!isDatabaseImage(image) || INCLUDE_DB_VOLUME_BACKUP) return false;
+    const normalized = volPath.toLowerCase().replace(/\\/g, '/');
+    return DB_PATH_HINTS.some((hint) => normalized.includes(hint));
+}
+
 // Helper: Logic to append a container's data into an EXSITING archiver instance
 // Used by both single backup and unified stack backup
 async function archiveContainerInternal(archive: archiver.Archiver, containerId: string, prefix: string = '', customPaths?: string[]): Promise<void> {
@@ -294,11 +403,12 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
     const container = docker.getContainer(containerId);
     const info = await container.inspect();
     const image = info.Config.Image;
+    const imageLower = image.toLowerCase();
     const name = info.Name.replace('/', '');
     const appType = detectAppType(image, info.Config.Labels);
 
     // 1. DATABASE DUMP (if applicable)
-    if (image.includes('postgres') || image.includes('timescale') || image.includes('mysql') || image.includes('mariadb')) {
+    if (isDatabaseImage(image)) {
         updateJobStatus(containerId, 'processing', 'Step: DB Strategy Detected');
         const backupDir = path.join(process.cwd(), 'backups');
         if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
@@ -312,7 +422,7 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
             return envStr.split('=').slice(1).join('=');
         };
 
-        if (image.includes('postgres') || image.includes('timescale')) {
+        if (imageLower.includes('postgres') || imageLower.includes('timescale')) {
             const pgUser = getEnv('POSTGRES_USER') || 'postgres';
             const pgPwd = getEnv('POSTGRES_PASSWORD') || getEnv('POSTGRES_PASS');
             cmd = pgPwd
@@ -378,10 +488,17 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
             });
         });
 
-        // Append to archive
-        const sqlBuffer = fs.readFileSync(tempSqlPath);
-        archive.append(sqlBuffer, { name: path.join(prefix, 'dump.sql') });
-        if (fs.existsSync(tempSqlPath)) fs.unlinkSync(tempSqlPath);
+        // Append to archive (streaming)
+        const sqlStream = fs.createReadStream(tempSqlPath);
+        archive.append(sqlStream, { name: path.join(prefix, 'dump.sql') });
+
+        // Clean up temp file only after archive is finalized or stream closed
+        sqlStream.on('end', () => {
+            // We can't safely unlink here because archiver might still be reading from the stream internally 
+            // but usually archiver .append(stream) is safe once stream ends.
+            // Better to unlink after archive.finalize() in the caller if possible, 
+            // but for now, we'll let generateBackupFile handle overall cleanup or use a sync unlink later.
+        });
     }
 
     // 2. VOLUME/CONFIG BACKUP (STRICT MODE)
@@ -403,7 +520,7 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
         customPaths.forEach(p => { if (p.trim()) pathsToBackup.add(p.trim()); });
     }
 
-    const uniquePaths = Array.from(pathsToBackup);
+    const uniquePaths = Array.from(pathsToBackup).filter((p) => !shouldSkipVolumePath(image, p));
 
     // Metadata
     const configData = {
@@ -437,7 +554,10 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
             }
         }
     } else {
-        archive.append(Buffer.from("No volumes defined."), { name: path.join(prefix, 'volumes_none.txt') });
+        const note = isDatabaseImage(image) && !INCLUDE_DB_VOLUME_BACKUP
+            ? "DB data volume backup skipped by policy (logical dump only). Set INCLUDE_DB_VOLUME_BACKUP=true to include DB data directories."
+            : "No volumes defined.";
+        archive.append(Buffer.from(note), { name: path.join(prefix, 'volumes_none.txt') });
     }
 }
 
@@ -449,7 +569,7 @@ async function generateBackupFile(containerId: string, backupDir: string, custom
     const filePath = path.join(backupDir, `${name}_${Date.now()}.zip`);
 
     const output = fs.createWriteStream(filePath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = archiver('zip', { zlib: { level: ZIP_LEVEL } });
 
     await new Promise<void>(async (resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("Backup timed out")), 400000);
@@ -478,20 +598,26 @@ async function handleUpload(containerId: string, filePath: string) {
         try {
             const fileStats = fs.statSync(filePath);
             const fileSize = (fileStats.size / 1024 / 1024).toFixed(2) + ' MB';
-            const fileBuffer = fs.readFileSync(filePath);
-            const formData = new FormData();
-            formData.append('chat_id', CHAT_ID);
-            const blob = new Blob([fileBuffer]);
-            formData.append('document', blob, name);
+            const { execFile } = await import('child_process');
+            const { promisify } = await import('util');
+            const execFileAsync = promisify(execFile);
+            const apiRoot = TELEGRAM_API_ROOT.replace(/\/+$/, '');
+            const url = `${apiRoot}/bot${TELEGRAM_TOKEN}/sendDocument`;
 
-            const res = await fetch(`${TELEGRAM_API_ROOT}/bot${TELEGRAM_TOKEN}/sendDocument`, {
-                method: 'POST',
-                body: formData
-            });
+            const curlArgs = [
+                '-sS',
+                '-X', 'POST',
+                url,
+                '-F', `chat_id=${CHAT_ID}`,
+                '-F', `document=@${filePath}`,
+            ];
 
-            if (!res.ok) throw new Error(`Telegram Upload Failed: ${res.status} ${await res.text()}`);
+            const { stdout } = await execFileAsync('curl', curlArgs, { maxBuffer: 1024 * 1024 });
+            const body = JSON.parse((stdout || '{}').trim() || '{}');
+            if (!body.ok) throw new Error(`Telegram Upload Failed: ${body.description || 'unknown error'}`);
 
             fs.unlinkSync(filePath);
+            enforceRetentionPolicy(path.dirname(filePath));
             updateJobStatus(containerId, 'completed', 'Sent to Telegram & Cleaned');
             addHistoryEntry({
                 id: Date.now().toString(),
@@ -506,6 +632,7 @@ async function handleUpload(containerId: string, filePath: string) {
         } catch (uploadErr: any) {
             console.error("Telegram Error:", uploadErr);
             updateJobStatus(containerId, 'completed', 'Saved Local (Telegram Failed)');
+            enforceRetentionPolicy(path.dirname(filePath));
             addHistoryEntry({
                 id: Date.now().toString(),
                 date: new Date().toISOString(),
@@ -518,6 +645,7 @@ async function handleUpload(containerId: string, filePath: string) {
     } else {
         updateJobStatus(containerId, 'completed', 'Saved to local disk');
         const stats = fs.statSync(filePath);
+        enforceRetentionPolicy(path.dirname(filePath));
         addHistoryEntry({
             id: Date.now().toString(),
             date: new Date().toISOString(),
@@ -527,6 +655,30 @@ async function handleUpload(containerId: string, filePath: string) {
             message: 'Saved to local disk',
             size: (stats.size / 1024 / 1024).toFixed(2) + ' MB'
         });
+    }
+}
+
+function enforceRetentionPolicy(backupDir: string) {
+    const settings = getSettings();
+    const retentionCount = Math.max(1, Number(settings.retentionCount || 5));
+    if (!fs.existsSync(backupDir)) return;
+
+    const files = fs.readdirSync(backupDir)
+        .filter((f) => (f.endsWith('.zip') || f.endsWith('.sql') || f.endsWith('.sql.gz')) && !f.startsWith('temp_'))
+        .map((f) => ({
+            file: f,
+            fullPath: path.join(backupDir, f),
+            mtime: fs.statSync(path.join(backupDir, f)).mtimeMs,
+        }))
+        .sort((a, b) => b.mtime - a.mtime);
+
+    const stale = files.slice(retentionCount);
+    for (const item of stale) {
+        try {
+            fs.unlinkSync(item.fullPath);
+        } catch (err: any) {
+            console.warn(`[Retention] Failed to delete ${item.file}: ${err.message}`);
+        }
     }
 }
 

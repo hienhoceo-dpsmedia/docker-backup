@@ -31,7 +31,6 @@ import {
     getContainers,
     triggerBackup,
     triggerStackBackup,
-    triggerUnifiedStackBackup,
     getProgress,
     listBackups,
     restoreBackup,
@@ -271,7 +270,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     };
 
     const handleStackBackup = async (name: string) => {
-        const res = await triggerUnifiedStackBackup(name);
+        const res = await triggerStackBackup(name);
         if (res.success) {
             const updatedProgress = await getProgress();
             setProgress(updatedProgress);
