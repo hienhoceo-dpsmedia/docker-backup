@@ -13,7 +13,8 @@ import {
     getStacks,
     saveStack,
     deleteStack as deleteStackStore,
-    StackConfig
+    StackConfig,
+    BackupResourceUsage
 } from '@/lib/storage'; // Added imports
 import { parseStackYaml } from '@/lib/stack-parser';
 
@@ -37,6 +38,7 @@ const BACKUP_MAX_DEFERRALS = Math.max(0, Number(process.env.BACKUP_MAX_DEFERRALS
 const BACKUP_DISK_SAMPLE_MS = Math.max(200, Number(process.env.BACKUP_DISK_SAMPLE_MS || 1000));
 const BACKUP_MAX_LOADAVG = Number(process.env.BACKUP_MAX_LOADAVG || Math.max(1, os.cpus().length * 0.9));
 const BACKUP_MAX_DISK_UTIL = Math.max(1, Math.min(100, Number(process.env.BACKUP_MAX_DISK_UTIL || 85)));
+const BACKUP_RESOURCE_SAMPLE_MS = Math.max(500, Number(process.env.BACKUP_RESOURCE_SAMPLE_MS || 1000));
 const DB_PATH_HINTS = [
     '/var/lib/postgresql',
     '/var/lib/postgres',
@@ -48,6 +50,112 @@ const DB_PATH_HINTS = [
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function roundMetric(value: number, digits: number = 2) {
+    const factor = 10 ** digits;
+    return Math.round(value * factor) / factor;
+}
+
+function parseCpuPercent(stats: any): number {
+    const cpuDelta =
+        (stats?.cpu_stats?.cpu_usage?.total_usage || 0) -
+        (stats?.precpu_stats?.cpu_usage?.total_usage || 0);
+    const systemDelta =
+        (stats?.cpu_stats?.system_cpu_usage || 0) -
+        (stats?.precpu_stats?.system_cpu_usage || 0);
+    const onlineCpus =
+        stats?.cpu_stats?.online_cpus ||
+        stats?.cpu_stats?.cpu_usage?.percpu_usage?.length ||
+        1;
+
+    if (cpuDelta > 0 && systemDelta > 0) {
+        return (cpuDelta / systemDelta) * onlineCpus * 100;
+    }
+    return 0;
+}
+
+async function getContainerRuntimeSnapshot(containerId: string): Promise<{ cpuPct: number; memMB: number } | null> {
+    try {
+        const container = docker.getContainer(containerId);
+        const stats: any = await container.stats({ stream: false });
+        const cpuPct = parseCpuPercent(stats);
+        const memMB = (stats?.memory_stats?.usage || 0) / 1024 / 1024;
+        return { cpuPct, memMB };
+    } catch {
+        return null;
+    }
+}
+
+function createResourceTracker(targetContainerIds: string[]): () => Promise<BackupResourceUsage> {
+    const startedAt = Date.now();
+    let samples = 0;
+    let hostLoadSum = 0;
+    let hostLoadPeak = 0;
+    let targetCpuSum = 0;
+    let targetCpuPeak = 0;
+    let targetMemPeak = 0;
+    let appRssPeakMB = 0;
+    let inFlight = false;
+    let stopped = false;
+    let finalized: BackupResourceUsage | null = null;
+
+    const sampleOnce = async () => {
+        if (inFlight || stopped) return;
+        inFlight = true;
+        try {
+            const load1 = os.loadavg()[0];
+            hostLoadSum += load1;
+            hostLoadPeak = Math.max(hostLoadPeak, load1);
+
+            const targetStats = await Promise.all(
+                targetContainerIds.map((id) => getContainerRuntimeSnapshot(id))
+            );
+
+            let sampleCpuPeak = 0;
+            let sampleMemTotal = 0;
+            for (const s of targetStats) {
+                if (!s) continue;
+                sampleCpuPeak = Math.max(sampleCpuPeak, s.cpuPct);
+                sampleMemTotal += s.memMB;
+            }
+
+            targetCpuSum += sampleCpuPeak;
+            targetCpuPeak = Math.max(targetCpuPeak, sampleCpuPeak);
+            targetMemPeak = Math.max(targetMemPeak, sampleMemTotal);
+
+            const rssMB = process.memoryUsage().rss / 1024 / 1024;
+            appRssPeakMB = Math.max(appRssPeakMB, rssMB);
+            samples += 1;
+        } finally {
+            inFlight = false;
+        }
+    };
+
+    const timer = setInterval(() => {
+        void sampleOnce();
+    }, BACKUP_RESOURCE_SAMPLE_MS);
+    void sampleOnce();
+
+    return async () => {
+        if (finalized) return finalized;
+        stopped = true;
+        clearInterval(timer);
+        await sampleOnce();
+
+        const durationSec = (Date.now() - startedAt) / 1000;
+        finalized = {
+            durationSec: roundMetric(durationSec, 1),
+            hostLoadAvg: roundMetric(samples > 0 ? hostLoadSum / samples : 0),
+            hostLoadPeak: roundMetric(hostLoadPeak),
+            targetCpuAvgPct: roundMetric(samples > 0 ? targetCpuSum / samples : 0),
+            targetCpuPeakPct: roundMetric(targetCpuPeak),
+            targetMemPeakMB: roundMetric(targetMemPeak, 1),
+            appRssPeakMB: roundMetric(appRssPeakMB, 1),
+            sampleCount: samples,
+        };
+        return finalized;
+    };
 }
 
 function readDiskIoTimes(): Map<string, number> {
@@ -187,6 +295,7 @@ async function runUnifiedStackBackup(stackName: string) {
 
     const filePath = path.join(backupDir, `stack_${stackName}_${Date.now()}.zip`);
     const virtualId = `stack-${stackName}`; // For status tracking
+    let stopTracking: (() => Promise<BackupResourceUsage>) | null = null;
 
     try {
         updateJobStatus(virtualId, 'processing', `Starting Unified Backup for ${stackName}...`);
@@ -215,6 +324,7 @@ async function runUnifiedStackBackup(stackName: string) {
 
         const output = fs.createWriteStream(filePath);
         const archive = archiver('zip', { zlib: { level: ZIP_LEVEL } });
+        stopTracking = createResourceTracker(stackContainers.map((c) => c.Id));
 
         await new Promise<void>(async (resolve, reject) => {
             const timeout = setTimeout(() => reject(new Error("Unified Backup timeout")), 600000);
@@ -274,11 +384,13 @@ async function runUnifiedStackBackup(stackName: string) {
         });
 
         // 4. Handle Final Artifact
-        await handleUpload(virtualId, filePath);
+        const resourceUsage = stopTracking ? await stopTracking() : undefined;
+        await handleUpload(virtualId, filePath, resourceUsage);
         revalidatePath('/');
         return { success: true, path: filePath };
 
     } catch (error: any) {
+        if (stopTracking) await stopTracking();
         console.error("Unified Stack Backup Error:", error);
         updateJobStatus(virtualId, 'failed', error.message);
         return { success: false, error: error.message };
@@ -319,6 +431,7 @@ export async function triggerBackup(containerIds: string[], customPathsMap?: Rec
 
 // The Worker Function
 async function processBackup(containerId: string, customPaths?: string[]) {
+    const stopTracking = createResourceTracker([containerId]);
     try {
         updateJobStatus(containerId, 'processing', 'Identifying...');
         await waitForSystemCapacity(containerId);
@@ -327,11 +440,13 @@ async function processBackup(containerId: string, customPaths?: string[]) {
 
         // Generate the backup file
         const filePath = await generateBackupFile(containerId, backupDir, customPaths);
+        const resourceUsage = await stopTracking();
 
         // Handle Upload
-        await handleUpload(containerId, filePath);
+        await handleUpload(containerId, filePath, resourceUsage);
 
     } catch (error: any) {
+        const resourceUsage = await stopTracking();
         console.error(`Backup failed for ${containerId}:`, error);
         updateJobStatus(containerId, 'failed', error.message);
         addHistoryEntry({
@@ -340,7 +455,8 @@ async function processBackup(containerId: string, customPaths?: string[]) {
             containerName: 'Unknown',
             status: 'failed',
             destination: 'local',
-            message: error.message
+            message: error.message,
+            resourceUsage
         });
     }
 }
@@ -586,7 +702,7 @@ async function generateBackupFile(containerId: string, backupDir: string, custom
 }
 
 // Helper: Handles Upload to Telegram/Local
-async function handleUpload(containerId: string, filePath: string) {
+async function handleUpload(containerId: string, filePath: string, resourceUsage?: BackupResourceUsage) {
     const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
     const TELEGRAM_API_ROOT = process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org';
     const CHAT_ID = process.env.CHAT_ID;
@@ -626,7 +742,8 @@ async function handleUpload(containerId: string, filePath: string) {
                 status: 'success',
                 destination: 'telegram',
                 message: `Backup sent to Telegram`,
-                size: fileSize
+                size: fileSize,
+                resourceUsage
             });
 
         } catch (uploadErr: any) {
@@ -639,7 +756,8 @@ async function handleUpload(containerId: string, filePath: string) {
                 containerName: name,
                 status: 'failed',
                 destination: 'local',
-                message: `Telegram upload failed: ${uploadErr.message}`
+                message: `Telegram upload failed: ${uploadErr.message}`,
+                resourceUsage
             });
         }
     } else {
@@ -653,7 +771,8 @@ async function handleUpload(containerId: string, filePath: string) {
             status: 'success',
             destination: 'local',
             message: 'Saved to local disk',
-            size: (stats.size / 1024 / 1024).toFixed(2) + ' MB'
+            size: (stats.size / 1024 / 1024).toFixed(2) + ' MB',
+            resourceUsage
         });
     }
 }

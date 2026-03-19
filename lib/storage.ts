@@ -49,6 +49,18 @@ export interface HistoryEntry {
     message: string;
     size?: string;
     backupPath?: string; // Path for restore
+    resourceUsage?: BackupResourceUsage;
+}
+
+export interface BackupResourceUsage {
+    durationSec: number;
+    hostLoadAvg: number;
+    hostLoadPeak: number;
+    targetCpuAvgPct: number;
+    targetCpuPeakPct: number;
+    targetMemPeakMB: number;
+    appRssPeakMB: number;
+    sampleCount: number;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {

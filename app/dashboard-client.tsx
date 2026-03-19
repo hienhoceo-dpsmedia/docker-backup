@@ -25,7 +25,8 @@ import {
     Activity,
     Layers,
     Terminal,
-    Calendar
+    Calendar,
+    Copy
 } from 'lucide-react';
 import {
     getContainers,
@@ -54,6 +55,29 @@ import { format } from 'date-fns';
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
     return twMerge(clsx(inputs));
+}
+
+function formatResourceUsage(usage?: HistoryEntry['resourceUsage']) {
+    if (!usage) return '';
+    return `res: ${usage.durationSec}s | cpu↑ ${usage.targetCpuPeakPct}% | mem↑ ${usage.targetMemPeakMB}MB | load↑ ${usage.hostLoadPeak} | app-rss↑ ${usage.appRssPeakMB}MB`;
+}
+
+function toMarkdownCell(value: string) {
+    return (value || '-')
+        .replace(/\|/g, '\\|')
+        .replace(/\r?\n/g, ' ')
+        .trim();
+}
+
+function toHistoryClipboardText(entries: HistoryEntry[]) {
+    const header = '| Time | Container | Destination | Status | Size | Message | Resource |';
+    const divider = '|---|---|---|---|---|---|---|';
+    const rows = entries.map((entry) => {
+        const time = format(new Date(entry.date), 'yyyy-MM-dd HH:mm:ss');
+        const resource = formatResourceUsage(entry.resourceUsage) || '-';
+        return `| ${toMarkdownCell(time)} | ${toMarkdownCell(entry.containerName)} | ${toMarkdownCell(entry.destination)} | ${toMarkdownCell(entry.status)} | ${toMarkdownCell(entry.size || '-')} | ${toMarkdownCell(entry.message)} | ${toMarkdownCell(resource)} |`;
+    });
+    return [header, divider, ...rows].join('\n');
 }
 
 interface Container {
@@ -95,6 +119,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     const [showScheduleModal, setShowScheduleModal] = useState(false);
     const [schedulingStack, setSchedulingStack] = useState<string | null>(null);
     const [tempSchedule, setTempSchedule] = useState<any>({ frequency: 'daily', time: '02:00', dayOfWeek: 0 });
+    const [isHistoryCopied, setIsHistoryCopied] = useState(false);
 
     // Filter containers based on search
     const filteredContainers = containers.filter(c =>
@@ -140,6 +165,14 @@ export default function DashboardClient({ initialContainers }: { initialContaine
             setSelectedContainers([]);
             alert(`Started backup for ${res.count} containers`);
         }
+    };
+
+    const handleCopyAllHistory = async () => {
+        if (history.length === 0) return;
+        const text = toHistoryClipboardText(history);
+        await navigator.clipboard.writeText(text);
+        setIsHistoryCopied(true);
+        setTimeout(() => setIsHistoryCopied(false), 1500);
     };
 
     const handleRestore = async (file: string, containerId: string) => {
@@ -547,7 +580,25 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                         )}
 
                         {activeTab === 'history' && (
-                            <div className="bg-[#0b1120]/50 border border-slate-800/80 rounded-2xl overflow-hidden backdrop-blur-sm">
+                            <div className="space-y-4">
+                                <div className="flex justify-end">
+                                    <button
+                                        onClick={handleCopyAllHistory}
+                                        disabled={history.length === 0}
+                                        className={cn(
+                                            "px-3 py-2 text-xs font-bold rounded-lg border transition-all flex items-center gap-2",
+                                            history.length === 0
+                                                ? "bg-slate-900 text-slate-600 border-slate-800 cursor-not-allowed"
+                                                : "bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800 hover:text-white",
+                                            isHistoryCopied && "bg-emerald-600/20 text-emerald-300 border-emerald-500/40"
+                                        )}
+                                        title="Copy all history rows as Markdown table"
+                                    >
+                                        <Copy className="w-3.5 h-3.5" />
+                                        {isHistoryCopied ? 'Copied' : 'Copy All'}
+                                    </button>
+                                </div>
+                                <div className="bg-[#0b1120]/50 border border-slate-800/80 rounded-2xl overflow-hidden backdrop-blur-sm">
                                 <table className="w-full text-left">
                                     <thead>
                                         <tr className="bg-slate-900/50 text-slate-400 text-xs uppercase tracking-widest border-b border-slate-800">
@@ -583,11 +634,19 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                                     )}
                                                 </td>
                                                 <td className="px-6 py-4 text-sm text-slate-300">{entry.size || '-'}</td>
-                                                <td className="px-6 py-4 text-sm text-slate-400 italic max-w-xs truncate">{entry.message}</td>
+                                                <td className="px-6 py-4 text-sm text-slate-400 max-w-xs">
+                                                    <p className="italic truncate" title={entry.message}>{entry.message}</p>
+                                                    {entry.resourceUsage && (
+                                                        <p className="mt-1 text-[11px] font-mono text-slate-500 truncate" title={formatResourceUsage(entry.resourceUsage)}>
+                                                            {formatResourceUsage(entry.resourceUsage)}
+                                                        </p>
+                                                    )}
+                                                </td>
                                             </tr>
                                         ))}
                                     </tbody>
                                 </table>
+                            </div>
                             </div>
                         )}
 
