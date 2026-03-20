@@ -51,6 +51,15 @@ import {
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { format } from 'date-fns';
+import {
+    HALF_HOUR_SLOTS,
+    getDayLabel,
+    getScheduleOccupancy,
+    getScheduleSlotSummary,
+    slotIndexToTime,
+    timeToSlotIndex,
+    type SlotOccupancy,
+} from '@/lib/stack-schedule';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -59,7 +68,28 @@ function cn(...inputs: ClassValue[]) {
 
 function formatResourceUsage(usage?: HistoryEntry['resourceUsage']) {
     if (!usage) return '';
-    return `res: ${usage.durationSec}s | cpu↑ ${usage.targetCpuPeakPct}% | mem↑ ${usage.targetMemPeakMB}MB | load↑ ${usage.hostLoadPeak} | app-rss↑ ${usage.appRssPeakMB}MB`;
+    const fdUsage = (usage as HistoryEntry['resourceUsage'] & {
+        fdByPid?: Array<{
+            containerId?: string;
+            pid: number;
+            fdPeak: number;
+            fdLimit?: number;
+            fdUtilPeakPct?: number;
+            comm?: string;
+        }>;
+    }).fdByPid;
+    const fdByPid = fdUsage
+        ?.map((item) => {
+            const containerPrefix = item.containerId ? `${item.containerId.slice(0, 8)}:` : '';
+            const commSuffix = item.comm ? `:${item.comm}` : '';
+            if (item.fdLimit) {
+                return `${containerPrefix}${item.pid}${commSuffix}:${item.fdPeak}/${item.fdLimit}${item.fdUtilPeakPct !== undefined ? `(${item.fdUtilPeakPct}%)` : ''}`;
+            }
+            return `${containerPrefix}${item.pid}${commSuffix}:${item.fdPeak}`;
+        })
+        .join(', ');
+    const fdSegment = fdByPid ? ` | fd(pid)↑ ${fdByPid}` : '';
+    return `res: ${usage.durationSec}s | cpu↑ ${usage.targetCpuPeakPct}% | mem↑ ${usage.targetMemPeakMB}MB | load↑ ${usage.hostLoadPeak} | app-rss↑ ${usage.appRssPeakMB}MB${fdSegment}`;
 }
 
 function toMarkdownCell(value: string) {
@@ -96,6 +126,51 @@ interface BackupFile {
     date: string;
 }
 
+type StackScheduleConfig = AppSettings['stackSchedules'][string];
+
+const DEFAULT_STACK_SCHEDULE: StackScheduleConfig = { frequency: 'daily', time: '02:00', dayOfWeek: 0 };
+const WEEKDAY_SHORT_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+function getEditableStackSchedule(schedule?: StackScheduleConfig | null): StackScheduleConfig {
+    if (!schedule) return { ...DEFAULT_STACK_SCHEDULE };
+    if (schedule.frequency === 'manual') return { frequency: 'manual' };
+
+    const slotIndex = timeToSlotIndex(schedule.time) ?? timeToSlotIndex(DEFAULT_STACK_SCHEDULE.time)!;
+    return {
+        frequency: schedule.frequency,
+        time: slotIndexToTime(slotIndex),
+        dayOfWeek: schedule.frequency === 'weekly' ? schedule.dayOfWeek ?? 0 : 0,
+    };
+}
+
+function getPersistedStackSchedule(schedule: StackScheduleConfig): StackScheduleConfig {
+    if (schedule.frequency === 'manual') {
+        return { frequency: 'manual' };
+    }
+
+    const slotIndex = timeToSlotIndex(schedule.time) ?? timeToSlotIndex(DEFAULT_STACK_SCHEDULE.time)!;
+    return {
+        frequency: schedule.frequency,
+        time: slotIndexToTime(slotIndex),
+        dayOfWeek: schedule.frequency === 'weekly' ? schedule.dayOfWeek ?? 0 : 0,
+    };
+}
+
+function getStackVolumeCount(stack: StackConfig) {
+    return Object.values(stack.services).reduce((total, service) => total + service.volumes.length, 0);
+}
+
+function formatStackCount(count: number) {
+    return `${count} stack${count === 1 ? '' : 's'}`;
+}
+
+function formatOccupancyNames(occupancy?: SlotOccupancy) {
+    if (!occupancy || occupancy.stackNames.length === 0) return '';
+    if (occupancy.stackNames.length <= 2) return occupancy.stackNames.join(', ');
+    const [first, second, ...rest] = occupancy.stackNames;
+    return `${first}, ${second} +${rest.length}`;
+}
+
 export default function DashboardClient({ initialContainers }: { initialContainers: Container[] }) {
     const [activeTab, setActiveTab] = useState<'containers' | 'stacks' | 'history' | 'restore' | 'settings'>('containers');
     const [containers, setContainers] = useState<Container[]>(initialContainers);
@@ -118,7 +193,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     // Schedule Modal State
     const [showScheduleModal, setShowScheduleModal] = useState(false);
     const [schedulingStack, setSchedulingStack] = useState<string | null>(null);
-    const [tempSchedule, setTempSchedule] = useState<any>({ frequency: 'daily', time: '02:00', dayOfWeek: 0 });
+    const [tempSchedule, setTempSchedule] = useState<StackScheduleConfig>({ ...DEFAULT_STACK_SCHEDULE });
     const [isHistoryCopied, setIsHistoryCopied] = useState(false);
 
     // Filter containers based on search
@@ -126,6 +201,23 @@ export default function DashboardClient({ initialContainers }: { initialContaine
         c.Names[0].toLowerCase().includes(searchQuery.toLowerCase()) ||
         c.Image.toLowerCase().includes(searchQuery.toLowerCase())
     );
+    const stackSchedules = settings?.stackSchedules || {};
+    const stackEntries = Object.values(stacks).sort((left, right) => {
+        const leftSummary = getScheduleSlotSummary(stackSchedules[left.name]);
+        const rightSummary = getScheduleSlotSummary(stackSchedules[right.name]);
+
+        if (leftSummary && !rightSummary) return -1;
+        if (!leftSummary && rightSummary) return 1;
+        return left.name.localeCompare(right.name);
+    });
+    const tempScheduleSummary = getScheduleSlotSummary(tempSchedule);
+    const modalOccupancy = tempSchedule.frequency === 'manual'
+        ? {}
+        : getScheduleOccupancy(stackSchedules, {
+            frequency: tempSchedule.frequency,
+            dayOfWeek: tempSchedule.frequency === 'weekly' ? tempSchedule.dayOfWeek ?? 0 : undefined,
+            excludeStackName: schedulingStack || undefined,
+        });
 
     const refreshData = async () => {
         setIsRefreshing(true);
@@ -314,19 +406,20 @@ export default function DashboardClient({ initialContainers }: { initialContaine
 
     const handleOpenSchedule = (stackName: string) => {
         setSchedulingStack(stackName);
-        const existing = settings?.stackSchedules?.[stackName] || { frequency: 'manual', time: '02:00', dayOfWeek: 0 };
-        setTempSchedule(existing);
+        const existing = settings?.stackSchedules?.[stackName];
+        setTempSchedule(getEditableStackSchedule(existing));
         setShowScheduleModal(true);
     };
 
     const handleSaveSchedule = async () => {
         if (!schedulingStack || !settings) return;
+        const persistedSchedule = getPersistedStackSchedule(tempSchedule);
 
         const newSettings: AppSettings = {
             ...settings,
             stackSchedules: {
                 ...(settings.stackSchedules || {}),
-                [schedulingStack]: tempSchedule
+                [schedulingStack]: persistedSchedule
             }
         };
 
@@ -334,6 +427,47 @@ export default function DashboardClient({ initialContainers }: { initialContaine
         await saveSettingsAction(newSettings);
         setShowScheduleModal(false);
         setSchedulingStack(null);
+    };
+
+    const handleScheduleFrequencyChange = (frequency: StackScheduleConfig['frequency']) => {
+        if (frequency === 'manual') {
+            setTempSchedule({ frequency: 'manual' });
+            return;
+        }
+
+        setTempSchedule((prev) => {
+            const nextBase = prev.frequency === 'manual'
+                ? { ...DEFAULT_STACK_SCHEDULE }
+                : prev;
+            const slotIndex = timeToSlotIndex(nextBase.time) ?? timeToSlotIndex(DEFAULT_STACK_SCHEDULE.time)!;
+
+            return {
+                frequency,
+                time: slotIndexToTime(slotIndex),
+                dayOfWeek: frequency === 'weekly' ? nextBase.dayOfWeek ?? 0 : 0,
+            };
+        });
+    };
+
+    const handleScheduleDayChange = (dayOfWeek: number) => {
+        setTempSchedule((prev) => ({
+            ...(prev.frequency === 'manual' ? { ...DEFAULT_STACK_SCHEDULE, frequency: 'weekly' as const } : prev),
+            frequency: 'weekly',
+            dayOfWeek,
+        }));
+    };
+
+    const handleScheduleSlotChange = (slotIndex: number) => {
+        setTempSchedule((prev) => {
+            const nextBase = prev.frequency === 'manual'
+                ? { ...DEFAULT_STACK_SCHEDULE }
+                : prev;
+
+            return {
+                ...nextBase,
+                time: slotIndexToTime(slotIndex),
+            };
+        });
     };
 
     return (
@@ -811,7 +945,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                         </div>
                                         <div>
                                             <h2 className="text-3xl font-bold text-white tracking-tight">Stacks Manager</h2>
-                                            <p className="text-slate-500 font-medium">Map Portainer/Compose YAML to enhance backup accuracy.</p>
+                                            <p className="text-slate-500 font-medium">Compact stack rows with occupied schedule slots visible at a glance.</p>
                                         </div>
                                     </div>
                                     <button
@@ -823,7 +957,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                 </div>
 
                                 <div className="grid gap-6">
-                                    {Object.values(stacks).length === 0 ? (
+                                    {stackEntries.length === 0 ? (
                                         <div className="bg-[#0b1120] border border-slate-800/50 rounded-3xl p-16 text-center">
                                             <div className="w-20 h-20 bg-slate-900 rounded-full flex items-center justify-center mx-auto mb-6 border border-slate-800">
                                                 <Layers className="w-10 h-10 text-slate-700" />
@@ -838,85 +972,118 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                             </button>
                                         </div>
                                     ) : (
-                                        Object.values(stacks).map((stack) => (
-                                            <div key={stack.name} className="bg-[#0b1120] border border-slate-800/50 rounded-3xl p-8 hover:border-slate-700 transition-all group">
-                                                <div className="flex items-center justify-between mb-6">
-                                                    <div className="flex items-center gap-4">
-                                                        <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                                                            <Box className="w-5 h-5 text-blue-400" />
-                                                        </div>
-                                                        <div>
-                                                            <h3 className="text-lg font-bold text-white">{stack.name}</h3>
-                                                            <p className="text-xs text-slate-500">{Object.keys(stack.services).length} Services identified</p>
-                                                        </div>
-                                                    </div>
-                                                    <div className="flex items-center gap-3">
-                                                        <div className="hidden group-hover:block transition-all animate-in fade-in slide-in-from-right-2">
-                                                            <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5">
-                                                                <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                                                                <span className="text-[10px] font-bold text-slate-400 capitalize">
-                                                                    {settings?.stackSchedules?.[stack.name]?.frequency === 'manual' || !settings?.stackSchedules?.[stack.name]
-                                                                        ? 'No Schedule'
-                                                                        : `${settings?.stackSchedules[stack.name].frequency} @ ${settings?.stackSchedules[stack.name].time}`}
-                                                                </span>
+                                        stackEntries.map((stack) => {
+                                            const scheduleSummary = getScheduleSlotSummary(stackSchedules[stack.name]);
+                                            const conflictingOccupancy = scheduleSummary
+                                                ? getScheduleOccupancy(stackSchedules, {
+                                                    frequency: scheduleSummary.frequency,
+                                                    dayOfWeek: scheduleSummary.dayOfWeek,
+                                                    excludeStackName: stack.name,
+                                                })[scheduleSummary.slotIndex]
+                                                : undefined;
+                                            const volumeCount = getStackVolumeCount(stack);
+
+                                            return (
+                                                <div key={stack.name} className="bg-[#0b1120] border border-slate-800/60 rounded-3xl p-5 hover:border-slate-700 transition-all">
+                                                    <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
+                                                        <div className="flex min-w-0 items-start gap-4 xl:w-[28%]">
+                                                            <div className="p-3 bg-slate-900 rounded-2xl border border-slate-800">
+                                                                <Box className="w-5 h-5 text-blue-400" />
+                                                            </div>
+                                                            <div className="min-w-0">
+                                                                <h3 className="text-lg font-bold text-white truncate">{stack.name}</h3>
+                                                                <p className="text-xs text-slate-500 mt-1">
+                                                                    {Object.keys(stack.services).length} services • {volumeCount} mapped volumes
+                                                                </p>
                                                             </div>
                                                         </div>
-                                                        <button
-                                                            onClick={() => handleOpenSchedule(stack.name)}
-                                                            className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold rounded-lg border border-slate-700 transition-all active:scale-95"
-                                                            title="Configure Backup Schedule"
-                                                        >
-                                                            <Clock className="w-3.5 h-3.5" />
-                                                            Schedule
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleStackBackup(stack.name)}
-                                                            className="flex items-center gap-2 px-3 py-1.5 bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white text-xs font-bold rounded-lg border border-blue-500/20 transition-all active:scale-95 group/btn"
-                                                            title="Backup All Containers in Stack"
-                                                        >
-                                                            <Play className="w-3.5 h-3.5 fill-current group-hover/btn:fill-white" />
-                                                            Backup All
-                                                        </button>
-                                                        <button
-                                                            onClick={() => {
-                                                                setYamlInput(stack.yaml);
-                                                                setShowImportStack(true);
-                                                            }}
-                                                            className="p-2 text-slate-500 hover:text-white transition-colors"
-                                                            title="Edit YAML"
-                                                        >
-                                                            <Terminal className="w-5 h-5" />
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleDeleteStack(stack.name)}
-                                                            className="p-2 text-slate-500 hover:text-red-400 transition-colors"
-                                                            title="Delete"
-                                                        >
-                                                            <Trash2 className="w-5 h-5" />
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                                <div className="grid grid-cols-4 gap-4">
-                                                    {Object.values(stack.services).map(s => (
-                                                        <div key={s.name} className="bg-slate-900/50 border border-slate-800/50 rounded-xl p-4">
-                                                            <div className="font-bold text-slate-300 text-xs mb-1 truncate">{s.name}</div>
-                                                            <div className="text-[10px] text-slate-500 truncate">{s.image}</div>
-                                                            <div className="mt-2 flex gap-1">
-                                                                {s.volumes.length > 0 ? (
-                                                                    <span className="text-[10px] bg-blue-500/10 text-blue-500 px-1.5 py-0.5 rounded border border-blue-500/20">
-                                                                        {s.volumes.length} Volumes
-                                                                    </span>
+
+                                                        <div className="xl:w-[38%]">
+                                                            <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-slate-500 mb-2">
+                                                                Occupied Slots
+                                                            </p>
+                                                            <div className="flex flex-wrap items-center gap-2">
+                                                                {scheduleSummary ? (
+                                                                    <>
+                                                                        <span className={cn(
+                                                                            "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-bold",
+                                                                            scheduleSummary.frequency === 'daily'
+                                                                                ? "border-blue-500/25 bg-blue-500/10 text-blue-300"
+                                                                                : "border-fuchsia-500/25 bg-fuchsia-500/10 text-fuchsia-300"
+                                                                        )}>
+                                                                            <Calendar className="w-3.5 h-3.5" />
+                                                                            {scheduleSummary.frequencyLabel}
+                                                                        </span>
+                                                                        <span className={cn(
+                                                                            "inline-flex items-center rounded-full border px-3 py-1.5 text-xs font-bold",
+                                                                            conflictingOccupancy
+                                                                                ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                                                                                : "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                                                                        )}>
+                                                                            {scheduleSummary.slotLabel}
+                                                                        </span>
+                                                                        {conflictingOccupancy && (
+                                                                            <span className="inline-flex items-center rounded-full border border-amber-500/25 bg-slate-950/80 px-3 py-1.5 text-xs font-semibold text-amber-200">
+                                                                                Collides with {formatStackCount(conflictingOccupancy.count)}
+                                                                            </span>
+                                                                        )}
+                                                                    </>
                                                                 ) : (
-                                                                    <span className="text-[10px] bg-orange-500/10 text-orange-500 px-1.5 py-0.5 rounded border border-orange-500/20">
-                                                                        No Volumes
+                                                                    <span className="inline-flex items-center rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-bold text-slate-400">
+                                                                        Manual
                                                                     </span>
                                                                 )}
                                                             </div>
+                                                            <p className="text-xs text-slate-500 mt-2 min-h-5">
+                                                                {scheduleSummary
+                                                                    ? conflictingOccupancy
+                                                                        ? `Also used by ${formatOccupancyNames(conflictingOccupancy)}`
+                                                                        : 'No slot conflict detected in the same schedule context.'
+                                                                    : 'No reserved slot until you configure a schedule.'}
+                                                            </p>
                                                         </div>
-                                                    ))}
+
+                                                        <div className="flex flex-wrap items-center gap-2 xl:w-[34%] xl:justify-end">
+                                                            <button
+                                                                onClick={() => handleOpenSchedule(stack.name)}
+                                                                className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold rounded-xl border border-slate-700 transition-all active:scale-95"
+                                                                title="Configure Backup Schedule"
+                                                            >
+                                                                <Clock className="w-3.5 h-3.5" />
+                                                                Schedule
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleStackBackup(stack.name)}
+                                                                className="flex items-center gap-2 px-3 py-2 bg-blue-600/10 hover:bg-blue-600 text-blue-400 hover:text-white text-xs font-bold rounded-xl border border-blue-500/20 transition-all active:scale-95 group/btn"
+                                                                title="Backup All Containers in Stack"
+                                                            >
+                                                                <Play className="w-3.5 h-3.5 fill-current group-hover/btn:fill-white" />
+                                                                Backup All
+                                                            </button>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setYamlInput(stack.yaml);
+                                                                    setShowImportStack(true);
+                                                                }}
+                                                                className="inline-flex items-center gap-2 px-3 py-2 text-slate-400 hover:text-white border border-slate-700 rounded-xl bg-slate-900/60 hover:bg-slate-800 transition-colors text-xs font-bold"
+                                                                title="Edit YAML"
+                                                            >
+                                                                <Terminal className="w-4 h-4" />
+                                                                Edit
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleDeleteStack(stack.name)}
+                                                                className="inline-flex items-center gap-2 px-3 py-2 text-slate-400 hover:text-red-300 border border-slate-700 rounded-xl bg-slate-900/60 hover:bg-red-500/10 transition-colors text-xs font-bold"
+                                                                title="Delete"
+                                                            >
+                                                                <Trash2 className="w-4 h-4" />
+                                                                Delete
+                                                            </button>
+                                                        </div>
+                                                    </div>
                                                 </div>
-                                            </div>
-                                        ))
+                                            );
+                                        })
                                     )}
                                 </div>
                             </div>
@@ -1001,60 +1168,53 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                 {showScheduleModal && (
                     <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
                         <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" onClick={() => setShowScheduleModal(false)} />
-                        <div className="relative bg-[#0b1120] border border-slate-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+                        <div className="relative bg-[#0b1120] border border-slate-800 rounded-3xl w-full max-w-5xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
                             <div className="p-8 border-b border-slate-800/50 flex items-center justify-between">
                                 <div className="flex items-center gap-3">
                                     <div className="p-2 bg-blue-600/20 rounded-lg">
                                         <Clock className="w-5 h-5 text-blue-500" />
                                     </div>
-                                    <h3 className="text-xl font-bold text-white truncate max-w-[200px]">Schedule: {schedulingStack}</h3>
+                                    <div>
+                                        <h3 className="text-xl font-bold text-white truncate max-w-[320px]">Schedule: {schedulingStack}</h3>
+                                        <p className="text-sm text-slate-500">Choose 30-minute slots and see conflicts before saving.</p>
+                                    </div>
                                 </div>
                                 <button onClick={() => setShowScheduleModal(false)} className="text-slate-500 hover:text-white">
                                     <XCircle className="w-6 h-6" />
                                 </button>
                             </div>
-                            <div className="p-8 space-y-6">
-                                <div className="space-y-3">
-                                    <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Backup Frequency</label>
-                                    <div className="grid grid-cols-1 gap-2">
-                                        {['manual', 'daily', 'weekly'].map((freq) => (
-                                            <button
-                                                key={freq}
-                                                onClick={() => setTempSchedule((prev: any) => ({ ...prev, frequency: freq }))}
-                                                className={cn(
-                                                    "w-full px-4 py-3 rounded-xl border text-sm font-bold transition-all text-left flex items-center justify-between",
-                                                    tempSchedule.frequency === freq
-                                                        ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-500/20"
-                                                        : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200"
-                                                )}
-                                            >
-                                                <span className="capitalize">{freq}</span>
-                                                {tempSchedule.frequency === freq && <CheckCircle2 className="w-4 h-4" />}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-
-                                {tempSchedule.frequency !== 'manual' && (
-                                    <div className="animate-in fade-in slide-in-from-top-2 duration-300 space-y-6">
+                            <div className="p-8">
+                                <div className="grid gap-8 lg:grid-cols-[280px_minmax(0,1fr)]">
+                                    <div className="space-y-6">
                                         <div className="space-y-3">
-                                            <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Preferred Time</label>
-                                            <input
-                                                type="time"
-                                                value={tempSchedule.time}
-                                                onChange={(e: any) => setTempSchedule((prev: any) => ({ ...prev, time: e.target.value }))}
-                                                className="w-full bg-slate-950 border border-slate-800 rounded-2xl p-4 text-white font-mono focus:ring-2 focus:ring-blue-500 outline-none"
-                                            />
+                                            <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Backup Frequency</label>
+                                            <div className="grid grid-cols-1 gap-2">
+                                                {(['manual', 'daily', 'weekly'] as const).map((freq) => (
+                                                    <button
+                                                        key={freq}
+                                                        onClick={() => handleScheduleFrequencyChange(freq)}
+                                                        className={cn(
+                                                            "w-full px-4 py-3 rounded-xl border text-sm font-bold transition-all text-left flex items-center justify-between",
+                                                            tempSchedule.frequency === freq
+                                                                ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-500/20"
+                                                                : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                                                        )}
+                                                    >
+                                                        <span className="capitalize">{freq}</span>
+                                                        {tempSchedule.frequency === freq && <CheckCircle2 className="w-4 h-4" />}
+                                                    </button>
+                                                ))}
+                                            </div>
                                         </div>
 
                                         {tempSchedule.frequency === 'weekly' && (
                                             <div className="space-y-3">
                                                 <label className="text-xs font-bold text-slate-500 uppercase tracking-widest">Day of week</label>
-                                                <div className="grid grid-cols-7 gap-1">
-                                                    {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((day, i) => (
+                                                <div className="grid grid-cols-7 gap-1.5">
+                                                    {WEEKDAY_SHORT_LABELS.map((day, i) => (
                                                         <button
                                                             key={i}
-                                                            onClick={() => setTempSchedule((prev: any) => ({ ...prev, dayOfWeek: i }))}
+                                                            onClick={() => handleScheduleDayChange(i)}
                                                             className={cn(
                                                                 "h-10 rounded-lg text-xs font-bold transition-all",
                                                                 tempSchedule.dayOfWeek === i
@@ -1068,10 +1228,109 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                                 </div>
                                             </div>
                                         )}
-                                    </div>
-                                )}
 
-                                <div className="pt-4 flex gap-4">
+                                        <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4 space-y-3">
+                                            <div>
+                                                <p className="text-xs font-bold uppercase tracking-[0.24em] text-slate-500">Current selection</p>
+                                                <p className="text-lg font-bold text-white mt-2">
+                                                    {tempScheduleSummary ? tempScheduleSummary.slotLabel : 'Manual only'}
+                                                </p>
+                                                <p className="text-sm text-slate-400 mt-1">
+                                                    {tempScheduleSummary
+                                                        ? `${tempScheduleSummary.frequencyLabel}${tempScheduleSummary.dayLabel ? ` • ${tempScheduleSummary.dayLabel}` : ''}`
+                                                        : 'This stack will not reserve a backup slot.'}
+                                                </p>
+                                            </div>
+                                            {tempScheduleSummary && modalOccupancy[tempScheduleSummary.slotIndex] && (
+                                                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-200">
+                                                    Occupied by {formatOccupancyNames(modalOccupancy[tempScheduleSummary.slotIndex])}
+                                                </div>
+                                            )}
+                                            {tempScheduleSummary && !modalOccupancy[tempScheduleSummary.slotIndex] && (
+                                                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-sm text-emerald-200">
+                                                    Slot is free in this scheduling context.
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    <div className="min-w-0">
+                                        {tempSchedule.frequency === 'manual' ? (
+                                            <div className="h-full rounded-2xl border border-slate-800 bg-slate-950/60 p-8 flex items-center justify-center text-center">
+                                                <div>
+                                                    <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center mx-auto mb-4">
+                                                        <Clock className="w-6 h-6 text-slate-500" />
+                                                    </div>
+                                                    <h4 className="text-lg font-bold text-white mb-2">No slot reserved</h4>
+                                                    <p className="text-sm text-slate-500 max-w-md">
+                                                        Switch to daily or weekly to pick a 30-minute slot and see which times are already occupied by other stacks.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
+                                                <div className="flex items-center justify-between gap-4">
+                                                    <div>
+                                                        <p className="text-xs font-bold uppercase tracking-[0.24em] text-slate-500">Slot availability</p>
+                                                        <h4 className="text-lg font-bold text-white mt-2">
+                                                            {tempSchedule.frequency === 'daily'
+                                                                ? 'Daily slots across one day'
+                                                                : `Weekly slots for ${getDayLabel(tempSchedule.dayOfWeek ?? 0)}`}
+                                                        </h4>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 text-xs">
+                                                        <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-emerald-200">Free</span>
+                                                        <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-amber-200">Occupied</span>
+                                                        <span className="inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-blue-200">Selected</span>
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 max-h-[30rem] overflow-y-auto pr-1">
+                                                    {HALF_HOUR_SLOTS.map((slot) => {
+                                                        const occupancy = modalOccupancy[slot.index];
+                                                        const isSelected = tempScheduleSummary?.slotIndex === slot.index;
+
+                                                        return (
+                                                            <button
+                                                                key={slot.index}
+                                                                onClick={() => handleScheduleSlotChange(slot.index)}
+                                                                className={cn(
+                                                                    "rounded-2xl border p-4 text-left transition-all min-h-[108px]",
+                                                                    isSelected
+                                                                        ? "border-blue-500 bg-blue-600/10 shadow-lg shadow-blue-500/10"
+                                                                        : occupancy
+                                                                            ? "border-amber-500/25 bg-amber-500/10 hover:border-amber-400/40"
+                                                                            : "border-slate-800 bg-slate-950/60 hover:border-slate-700 hover:bg-slate-900"
+                                                                )}
+                                                            >
+                                                                <div className="flex items-start justify-between gap-2">
+                                                                    <div>
+                                                                        <div className="text-sm font-bold text-white">{slot.start}</div>
+                                                                        <div className="text-[11px] text-slate-500">{slot.end}</div>
+                                                                    </div>
+                                                                    {isSelected && <CheckCircle2 className="w-4 h-4 text-blue-300 flex-shrink-0" />}
+                                                                </div>
+                                                                <div className={cn(
+                                                                    "mt-4 inline-flex rounded-full border px-2.5 py-1 text-[11px] font-bold",
+                                                                    occupancy
+                                                                        ? "border-amber-500/25 bg-amber-500/10 text-amber-200"
+                                                                        : "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
+                                                                )}>
+                                                                    {occupancy ? `${formatStackCount(occupancy.count)} occupied` : 'Available'}
+                                                                </div>
+                                                                <div className="mt-2 text-[11px] text-slate-400">
+                                                                    {occupancy ? formatOccupancyNames(occupancy) : 'No stack scheduled here'}
+                                                                </div>
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                <div className="pt-6 flex gap-4">
                                     <button
                                         onClick={() => setShowScheduleModal(false)}
                                         className="flex-1 px-6 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl border border-slate-700 transition-all"
