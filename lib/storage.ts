@@ -61,6 +61,16 @@ export interface BackupResourceUsage {
     targetMemPeakMB: number;
     appRssPeakMB: number;
     sampleCount: number;
+    fdByPid?: BackupResourceFdPid[];
+}
+
+export interface BackupResourceFdPid {
+    containerId?: string;
+    pid: number;
+    fdPeak: number;
+    fdLimit?: number;
+    fdUtilPeakPct?: number;
+    comm?: string;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {

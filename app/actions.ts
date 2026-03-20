@@ -17,6 +17,12 @@ import {
     BackupResourceUsage
 } from '@/lib/storage'; // Added imports
 import { parseStackYaml } from '@/lib/stack-parser';
+import {
+    createEmptyFdPeakMap,
+    finalizeFdPeaks,
+    mergeFdPeakSnapshots,
+    parseContainerFdSnapshotOutput,
+} from '@/lib/fd-telemetry';
 
 // Re-export types for client components (without node:fs)
 export type { AppSettings, HistoryEntry, StackConfig } from '@/lib/storage';
@@ -39,6 +45,7 @@ const BACKUP_DISK_SAMPLE_MS = Math.max(200, Number(process.env.BACKUP_DISK_SAMPL
 const BACKUP_MAX_LOADAVG = Number(process.env.BACKUP_MAX_LOADAVG || Math.max(1, os.cpus().length * 0.9));
 const BACKUP_MAX_DISK_UTIL = Math.max(1, Math.min(100, Number(process.env.BACKUP_MAX_DISK_UTIL || 85)));
 const BACKUP_RESOURCE_SAMPLE_MS = Math.max(500, Number(process.env.BACKUP_RESOURCE_SAMPLE_MS || 1000));
+const BACKUP_FD_SAMPLE_MS = Math.max(1000, Number(process.env.BACKUP_FD_SAMPLE_MS || 5000));
 const DB_PATH_HINTS = [
     '/var/lib/postgresql',
     '/var/lib/postgres',
@@ -87,6 +94,75 @@ async function getContainerRuntimeSnapshot(containerId: string): Promise<{ cpuPc
     }
 }
 
+async function execInContainer(containerId: string, cmd: string[]): Promise<{ stdout: string; exitCode: number }> {
+    const container = docker.getContainer(containerId);
+    const exec = await container.exec({
+        Cmd: cmd,
+        AttachStdout: true,
+        AttachStderr: true,
+    });
+
+    const stream = await exec.start({ hijack: true, stdin: false });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+        const stdoutSink = {
+            write(chunk: Buffer | string) {
+                stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            },
+        } as any;
+        const stderrSink = {
+            write(chunk: Buffer | string) {
+                stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            },
+        } as any;
+
+        container.modem.demuxStream(stream as any, stdoutSink, stderrSink);
+        stream.on('end', resolve);
+        stream.on('close', resolve);
+        stream.on('error', reject);
+    });
+
+    const info: any = await exec.inspect();
+    const exitCode = Number(info?.ExitCode ?? 1);
+    const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+    if (exitCode !== 0) {
+        const stderr = Buffer.concat(stderrChunks).toString('utf-8').trim();
+        throw new Error(stderr || `exec failed with exit code ${exitCode}`);
+    }
+    return { stdout, exitCode };
+}
+
+async function getContainerFdSnapshots(containerId: string): Promise<Array<{ pid: number; fdCount: number; fdLimit: number | null; fdUtilPct: number | null; comm?: string }>> {
+    try {
+        const script = [
+            'for p in /proc/[0-9]*; do',
+            '  pid=${p##*/}',
+            '  [ -r "$p/fd" ] || continue',
+            '  c=$(ls -1 "$p/fd" 2>/dev/null | wc -l | tr -d " ")',
+            '  [ -z "$c" ] && continue',
+            '  [ "$c" -le 0 ] 2>/dev/null && continue',
+            '  lim=$(awk \'/^Max open files/ {print $4; exit}\' "$p/limits" 2>/dev/null)',
+            '  [ "$lim" = "unlimited" ] && lim=0',
+            '  comm=$(cat "$p/comm" 2>/dev/null | tr "," "_" | tr " " "_")',
+            '  if [ -n "$lim" ] && [ "$lim" -gt 0 ] 2>/dev/null; then',
+            '    util=$(awk -v c="$c" -v l="$lim" \'BEGIN {printf "%.2f", (c/l)*100}\')',
+            '  else',
+            '    lim=0',
+            '    util=""',
+            '  fi',
+            '  printf "%s,%s,%s,%s,%s\\n" "$pid" "$c" "$lim" "$util" "$comm"',
+            'done | sort -t, -k2,2nr | head -n 5',
+        ].join('\n');
+
+        const { stdout } = await execInContainer(containerId, ['sh', '-lc', script]);
+        return parseContainerFdSnapshotOutput(stdout);
+    } catch {
+        return [];
+    }
+}
+
 function createResourceTracker(targetContainerIds: string[]): () => Promise<BackupResourceUsage> {
     const startedAt = Date.now();
     let samples = 0;
@@ -96,6 +172,8 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
     let targetCpuPeak = 0;
     let targetMemPeak = 0;
     let appRssPeakMB = 0;
+    let lastFdSampleAt = 0;
+    const fdPeakByPid = createEmptyFdPeakMap();
     let inFlight = false;
     let stopped = false;
     let finalized: BackupResourceUsage | null = null;
@@ -124,6 +202,20 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
             targetCpuPeak = Math.max(targetCpuPeak, sampleCpuPeak);
             targetMemPeak = Math.max(targetMemPeak, sampleMemTotal);
 
+            const now = Date.now();
+            if (now - lastFdSampleAt >= BACKUP_FD_SAMPLE_MS) {
+                lastFdSampleAt = now;
+                const fdSnapshots = await Promise.all(
+                    targetContainerIds.map(async (containerId) => ({
+                        containerId,
+                        rows: await getContainerFdSnapshots(containerId),
+                    }))
+                );
+                for (const item of fdSnapshots) {
+                    mergeFdPeakSnapshots(fdPeakByPid, item.containerId, item.rows);
+                }
+            }
+
             const rssMB = process.memoryUsage().rss / 1024 / 1024;
             appRssPeakMB = Math.max(appRssPeakMB, rssMB);
             samples += 1;
@@ -144,6 +236,11 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
         await sampleOnce();
 
         const durationSec = (Date.now() - startedAt) / 1000;
+        const fdByPid = finalizeFdPeaks(fdPeakByPid).map((item) => ({
+            ...item,
+            fdUtilPeakPct: item.fdUtilPeakPct !== undefined ? roundMetric(item.fdUtilPeakPct) : undefined,
+        }));
+
         finalized = {
             durationSec: roundMetric(durationSec, 1),
             hostLoadAvg: roundMetric(samples > 0 ? hostLoadSum / samples : 0),
@@ -153,6 +250,7 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
             targetMemPeakMB: roundMetric(targetMemPeak, 1),
             appRssPeakMB: roundMetric(appRssPeakMB, 1),
             sampleCount: samples,
+            fdByPid: fdByPid.length > 0 ? fdByPid : undefined,
         };
         return finalized;
     };
