@@ -82,3 +82,25 @@ export function finalizeFdPeaks(peakMap: FdPeakMap): BackupResourceFdPid[] {
             return right.fdPeak - left.fdPeak;
         });
 }
+
+export function filterFdTelemetry(
+    entries: BackupResourceFdPid[],
+    options: {
+        maxEntries: number;
+        minFdPeak: number;
+        minFdUtilPct: number;
+    }
+) {
+    return entries
+        .filter((entry) =>
+            (entry.fdUtilPeakPct !== undefined && entry.fdUtilPeakPct >= options.minFdUtilPct) ||
+            entry.fdPeak >= options.minFdPeak
+        )
+        .sort((left, right) => {
+            const leftUtil = left.fdUtilPeakPct ?? -1;
+            const rightUtil = right.fdUtilPeakPct ?? -1;
+            if (rightUtil !== leftUtil) return rightUtil - leftUtil;
+            return right.fdPeak - left.fdPeak;
+        })
+        .slice(0, Math.max(0, options.maxEntries));
+}

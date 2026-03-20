@@ -20,7 +20,6 @@ import {
     SearchCheck,
     AlertCircle,
     Info,
-    Network,
     Plus,
     Activity,
     Layers,
@@ -183,7 +182,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
     const [progress, setProgress] = useState<Record<string, any>>({});
     const [selectedContainers, setSelectedContainers] = useState<string[]>([]);
     const [isUploading, setIsUploading] = useState(false);
-    const [isRestoring, setIsRestoring] = useState(false);
+    const [, setIsRestoring] = useState(false);
     const [customPaths, setCustomPaths] = useState<Record<string, string>>({});
     const [showImportStack, setShowImportStack] = useState(false);
     const [yamlInput, setYamlInput] = useState('');
@@ -793,7 +792,7 @@ export default function DashboardClient({ initialContainers }: { initialContaine
                                     <div>
                                         <h3 className="text-lg font-semibold text-white mb-1">Smart Restore Technology</h3>
                                         <p className="text-slate-400 text-sm mb-4">
-                                            Restore Center now supports <b>Automatic Cloning</b>. We'll handle port conflicts, preserve networks, and restore data into a NEW container automatically.
+                                            Restore Center now supports <b>Automatic Cloning</b>. We&apos;ll handle port conflicts, preserve networks, and restore data into a NEW container automatically.
                                         </p>
                                         <div className="flex items-center gap-4">
                                             <label className={cn(

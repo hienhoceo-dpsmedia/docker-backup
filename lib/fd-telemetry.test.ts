@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
     createEmptyFdPeakMap,
     finalizeFdPeaks,
+    filterFdTelemetry,
     mergeFdPeakSnapshots,
     parseContainerFdSnapshotOutput,
 } from './fd-telemetry.ts';
@@ -73,5 +74,23 @@ test('merges snapshots by container and pid using the highest observed peaks', (
             fdUtilPeakPct: undefined,
             comm: 'bash',
         },
+    ]);
+});
+
+test('filters fd telemetry to the most relevant entries before persistence', () => {
+    const filtered = filterFdTelemetry([
+        { containerId: 'a', pid: 1, fdPeak: 12, comm: 'tiny' },
+        { containerId: 'b', pid: 2, fdPeak: 44, comm: 'worker' },
+        { containerId: 'c', pid: 3, fdPeak: 20, fdUtilPeakPct: 85, comm: 'postgres' },
+        { containerId: 'd', pid: 4, fdPeak: 90, comm: 'redis' },
+    ], {
+        maxEntries: 2,
+        minFdPeak: 32,
+        minFdUtilPct: 70,
+    });
+
+    assert.deepEqual(filtered, [
+        { containerId: 'c', pid: 3, fdPeak: 20, fdUtilPeakPct: 85, comm: 'postgres' },
+        { containerId: 'd', pid: 4, fdPeak: 90, comm: 'redis' },
     ]);
 });

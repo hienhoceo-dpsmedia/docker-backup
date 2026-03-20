@@ -9,7 +9,6 @@ import {
     getSettings,
     saveSettings,
     AppSettings,
-    HistoryEntry,
     getStacks,
     saveStack,
     deleteStack as deleteStackStore,
@@ -19,10 +18,17 @@ import {
 import { parseStackYaml } from '@/lib/stack-parser';
 import {
     createEmptyFdPeakMap,
+    filterFdTelemetry,
     finalizeFdPeaks,
     mergeFdPeakSnapshots,
     parseContainerFdSnapshotOutput,
 } from '@/lib/fd-telemetry';
+import {
+    buildResourceUsageSummary,
+    calculateDiskUtilizationPercentFromSamples,
+    parseCpuPercent,
+    summarizeRuntimeSnapshots,
+} from '@/lib/resource-tracking';
 
 // Re-export types for client components (without node:fs)
 export type { AppSettings, HistoryEntry, StackConfig } from '@/lib/storage';
@@ -35,8 +41,6 @@ import archiver from 'archiver'; // Installed dependency
 import AdmZip from 'adm-zip'; // Installed for restore
 import yaml from 'js-yaml'; // For YAML parsing in conflict resolution
 
-// Helper to check if Rclone is configured (Mock for MVP)
-const hasRclone = false; // Set to true if Rclone is configured
 const ZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.BACKUP_ZIP_LEVEL || 4)));
 const INCLUDE_DB_VOLUME_BACKUP = process.env.INCLUDE_DB_VOLUME_BACKUP === 'true';
 const BACKUP_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.BACKUP_CHECK_INTERVAL_MS || 30000));
@@ -46,6 +50,9 @@ const BACKUP_MAX_LOADAVG = Number(process.env.BACKUP_MAX_LOADAVG || Math.max(1, 
 const BACKUP_MAX_DISK_UTIL = Math.max(1, Math.min(100, Number(process.env.BACKUP_MAX_DISK_UTIL || 85)));
 const BACKUP_RESOURCE_SAMPLE_MS = Math.max(500, Number(process.env.BACKUP_RESOURCE_SAMPLE_MS || 1000));
 const BACKUP_FD_SAMPLE_MS = Math.max(1000, Number(process.env.BACKUP_FD_SAMPLE_MS || 5000));
+const BACKUP_FD_MAX_PIDS = Math.max(1, Number(process.env.BACKUP_FD_MAX_PIDS || 8));
+const BACKUP_FD_MIN_PEAK = Math.max(1, Number(process.env.BACKUP_FD_MIN_PEAK || 32));
+const BACKUP_FD_MIN_UTIL_PCT = Math.max(1, Number(process.env.BACKUP_FD_MIN_UTIL_PCT || 70));
 const DB_PATH_HINTS = [
     '/var/lib/postgresql',
     '/var/lib/postgres',
@@ -57,29 +64,6 @@ const DB_PATH_HINTS = [
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function roundMetric(value: number, digits: number = 2) {
-    const factor = 10 ** digits;
-    return Math.round(value * factor) / factor;
-}
-
-function parseCpuPercent(stats: any): number {
-    const cpuDelta =
-        (stats?.cpu_stats?.cpu_usage?.total_usage || 0) -
-        (stats?.precpu_stats?.cpu_usage?.total_usage || 0);
-    const systemDelta =
-        (stats?.cpu_stats?.system_cpu_usage || 0) -
-        (stats?.precpu_stats?.system_cpu_usage || 0);
-    const onlineCpus =
-        stats?.cpu_stats?.online_cpus ||
-        stats?.cpu_stats?.cpu_usage?.percpu_usage?.length ||
-        1;
-
-    if (cpuDelta > 0 && systemDelta > 0) {
-        return (cpuDelta / systemDelta) * onlineCpus * 100;
-    }
-    return 0;
 }
 
 async function getContainerRuntimeSnapshot(containerId: string): Promise<{ cpuPct: number; memMB: number } | null> {
@@ -190,13 +174,7 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
                 targetContainerIds.map((id) => getContainerRuntimeSnapshot(id))
             );
 
-            let sampleCpuPeak = 0;
-            let sampleMemTotal = 0;
-            for (const s of targetStats) {
-                if (!s) continue;
-                sampleCpuPeak = Math.max(sampleCpuPeak, s.cpuPct);
-                sampleMemTotal += s.memMB;
-            }
+            const { cpuPeak: sampleCpuPeak, memTotal: sampleMemTotal } = summarizeRuntimeSnapshots(targetStats);
 
             targetCpuSum += sampleCpuPeak;
             targetCpuPeak = Math.max(targetCpuPeak, sampleCpuPeak);
@@ -236,22 +214,23 @@ function createResourceTracker(targetContainerIds: string[]): () => Promise<Back
         await sampleOnce();
 
         const durationSec = (Date.now() - startedAt) / 1000;
-        const fdByPid = finalizeFdPeaks(fdPeakByPid).map((item) => ({
-            ...item,
-            fdUtilPeakPct: item.fdUtilPeakPct !== undefined ? roundMetric(item.fdUtilPeakPct) : undefined,
-        }));
+        const fdByPid = filterFdTelemetry(finalizeFdPeaks(fdPeakByPid), {
+            maxEntries: BACKUP_FD_MAX_PIDS,
+            minFdPeak: BACKUP_FD_MIN_PEAK,
+            minFdUtilPct: BACKUP_FD_MIN_UTIL_PCT,
+        });
 
-        finalized = {
-            durationSec: roundMetric(durationSec, 1),
-            hostLoadAvg: roundMetric(samples > 0 ? hostLoadSum / samples : 0),
-            hostLoadPeak: roundMetric(hostLoadPeak),
-            targetCpuAvgPct: roundMetric(samples > 0 ? targetCpuSum / samples : 0),
-            targetCpuPeakPct: roundMetric(targetCpuPeak),
-            targetMemPeakMB: roundMetric(targetMemPeak, 1),
-            appRssPeakMB: roundMetric(appRssPeakMB, 1),
+        finalized = buildResourceUsageSummary({
+            durationSec,
+            hostLoadAvg: samples > 0 ? hostLoadSum / samples : 0,
+            hostLoadPeak,
+            targetCpuAvgPct: samples > 0 ? targetCpuSum / samples : 0,
+            targetCpuPeakPct: targetCpuPeak,
+            targetMemPeakMB: targetMemPeak,
+            appRssPeakMB,
             sampleCount: samples,
-            fdByPid: fdByPid.length > 0 ? fdByPid : undefined,
-        };
+            fdByPid,
+        });
         return finalized;
     };
 }
@@ -277,16 +256,7 @@ async function getDiskUtilizationPercent(sampleMs: number): Promise<number | nul
         if (start.size === 0) return null;
         await sleep(sampleMs);
         const end = readDiskIoTimes();
-
-        let maxUtil = 0;
-        start.forEach((startIoMs, name) => {
-            const endIoMs = end.get(name);
-            if (endIoMs === undefined) return;
-            const delta = Math.max(0, endIoMs - startIoMs);
-            const util = (delta / sampleMs) * 100;
-            if (util > maxUtil) maxUtil = util;
-        });
-        return maxUtil;
+        return calculateDiskUtilizationPercentFromSamples(start, end, sampleMs);
     } catch {
         return null;
     }
@@ -929,7 +899,7 @@ function resolveEnvValue(val: string, envMap?: Record<string, string>): string {
 }
 
 // Helper: Restore volumes for a container while it is STOPPED
-async function restoreVolumesInternal(containerId: string, zip: AdmZip, prefix: string = '', envMap?: Record<string, string>) {
+async function restoreVolumesInternal(containerId: string, zip: AdmZip, prefix: string = '', _envMap?: Record<string, string>) {
     const container = docker.getContainer(containerId);
 
     console.log(`[Restore] Phase 0: Restoring volumes for ${containerId} while stopped...`);
@@ -983,12 +953,9 @@ async function restoreSqlInternal(containerId: string, zip: AdmZip, prefix: stri
         const env = info.Config.Env || [];
         let pgUser: string | undefined;
         let pgPwd: string | undefined;
-        let pgDb: string | undefined;
-
         if (image.includes('postgres') || image.includes('timescale')) {
             pgUser = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_USER='))?.split('=')[1] || 'postgres', envMap);
             pgPwd = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_PASSWORD='))?.split('=')[1] || env.find((e: string) => e.startsWith('POSTGRES_PASS='))?.split('=')[1] || '', envMap);
-            pgDb = resolveEnvValue(env.find((e: string) => e.startsWith('POSTGRES_DB='))?.split('=')[1] || pgUser || 'postgres', envMap);
 
             const targetDb = 'postgres';
             cmd = pgPwd
@@ -1253,7 +1220,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                         const container = docker.getContainer(c.Id);
                         await container.stop({ t: 10 });
                         await container.remove({ v: true, force: true });
-                    } catch (e) { /* ignore cleanup errors */ }
+                    } catch { /* ignore cleanup errors */ }
                 }
             }
         } catch (err) {
@@ -1399,7 +1366,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
                                 ready = true;
                                 break;
                             }
-                        } catch (e) { /* retry */ }
+                        } catch { /* retry */ }
                         await new Promise(r => setTimeout(r, 1000));
                     }
                     if (!ready) console.warn(`[Unified Restore] Database ${db.name} failed readiness check.`);
@@ -1904,7 +1871,7 @@ export async function restoreToNewContainer(filename: string, networkOverride?: 
             try {
                 const net = docker.getNetwork(targetNet);
                 await net.inspect();
-            } catch (err) {
+            } catch {
                 updateProgress(`Network ${targetNet} not found, using 'bridge'`);
                 networkingConfig.EndpointsConfig['bridge'] = {};
             }
