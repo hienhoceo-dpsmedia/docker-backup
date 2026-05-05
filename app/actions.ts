@@ -31,6 +31,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { revalidatePath } from 'next/cache';
+
+// Safe revalidatePath for background tasks
+
+function logStep(id: string, step: string, details?: string) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [${id}] [${step}] ${details || ''}`);
+    updateJobStatus(id, 'processing', `Step: ${step} ${details ? '(' + details + ')' : ''}`);
+}
+
+function safeRevalidatePath(path: string) {
+    try {
+        revalidatePath(path);
+    } catch (e) {
+        console.debug(`[Cache] revalidatePath skipped or failed for ${path} (expected in background tasks)`);
+    }
+}
 import archiver from 'archiver'; // Installed dependency
 import AdmZip from 'adm-zip'; // Installed for restore
 import yaml from 'js-yaml'; // For YAML parsing in conflict resolution
@@ -353,7 +369,7 @@ export async function importStackAction(yaml: string, name?: string, envVars?: R
         };
 
         saveStack(config);
-        revalidatePath('/');
+        safeRevalidatePath('/');
         return { success: true, name: stackName };
     } catch (error: any) {
         return { success: false, error: error.message };
@@ -362,12 +378,13 @@ export async function importStackAction(yaml: string, name?: string, envVars?: R
 
 export async function deleteStackAction(name: string) {
     deleteStackStore(name);
-    revalidatePath('/');
+    safeRevalidatePath('/');
     return { success: true };
 }
 
 export async function getContainers() {
     try {
+        logStep(virtualId, 'DISCOVERY', 'Listing containers...');
         const containers = await docker.listContainers({ all: true });
         return containers.map(c => ({
             Id: c.Id,
@@ -396,7 +413,8 @@ async function runUnifiedStackBackup(stackName: string) {
     let stopTracking: (() => Promise<BackupResourceUsage>) | null = null;
 
     try {
-        updateJobStatus(virtualId, 'processing', `Starting Unified Backup for ${stackName}...`);
+        logStep(virtualId, 'INIT', `Starting Unified Backup for ${stackName}...`);
+        logStep(virtualId, 'CAPACITY', 'Waiting for system capacity...');
         await waitForSystemCapacity(virtualId);
 
         const containers = await docker.listContainers({ all: true });
@@ -425,7 +443,7 @@ async function runUnifiedStackBackup(stackName: string) {
         stopTracking = createResourceTracker(stackContainers.map((c) => c.Id));
 
         await new Promise<void>(async (resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("Unified Backup timeout")), 600000);
+            const timeout = setTimeout(() => reject(new Error("Unified Backup timeout")), 1800000); // 30 minutes
             output.on('close', () => { clearTimeout(timeout); resolve(); });
             archive.on('error', (err: any) => { clearTimeout(timeout); reject(err); });
             archive.pipe(output);
@@ -474,7 +492,7 @@ async function runUnifiedStackBackup(stackName: string) {
             for (let i = 0; i < stackContainers.length; i++) {
                 const c = stackContainers[i];
                 const cName = c.Names[0].replace('/', '');
-                updateJobStatus(virtualId, 'processing', `Archiving Service [${i + 1}/${stackContainers.length}]: ${cName}`);
+                logStep(virtualId, 'SERVICE', `Archiving Service [${i + 1}/${stackContainers.length}]: ${cName}`);
                 await archiveContainerInternal(archive, c.Id, `services/${cName}`);
             }
 
@@ -483,13 +501,14 @@ async function runUnifiedStackBackup(stackName: string) {
 
         // 4. Handle Final Artifact
         const resourceUsage = stopTracking ? await stopTracking() : undefined;
+        logStep(virtualId, 'UPLOAD', 'Uploading backup artifact...');
         await handleUpload(virtualId, filePath, resourceUsage);
-        revalidatePath('/');
+        safeRevalidatePath('/');
         return { success: true, path: filePath };
 
     } catch (error: any) {
         if (stopTracking) await stopTracking();
-        console.error("Unified Stack Backup Error:", error);
+        console.error("[" + new Date().toISOString() + "] [" + virtualId + "] [ERROR] Unified Stack Backup Failed:", error);
         updateJobStatus(virtualId, 'failed', error.message);
         return { success: false, error: error.message };
     }
@@ -506,7 +525,7 @@ export async function triggerStackBackup(stackName: string) {
         backupQueue.add(async () => {
             await runUnifiedStackBackup(stackName);
         });
-        revalidatePath('/');
+        safeRevalidatePath('/');
         return { success: true, queued: true };
     } catch (error: any) {
         return { success: false, error: error.message || 'Failed to queue stack backup' };
@@ -523,7 +542,7 @@ export async function triggerBackup(containerIds: string[], customPathsMap?: Rec
             await processBackup(id, customPaths);
         });
     }
-    revalidatePath('/');
+    safeRevalidatePath('/');
     return { success: true, count: containerIds.length };
 }
 
@@ -531,7 +550,7 @@ export async function triggerBackup(containerIds: string[], customPathsMap?: Rec
 async function processBackup(containerId: string, customPaths?: string[]) {
     const stopTracking = createResourceTracker([containerId]);
     try {
-        updateJobStatus(containerId, 'processing', 'Identifying...');
+        logStep(containerId, 'INIT', 'Identifying container...');
         await waitForSystemCapacity(containerId);
         const backupDir = path.join(process.cwd(), 'backups');
         if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
@@ -545,7 +564,7 @@ async function processBackup(containerId: string, customPaths?: string[]) {
 
     } catch (error: any) {
         const resourceUsage = await stopTracking();
-        console.error(`Backup failed for ${containerId}:`, error);
+        console.error(`[${new Date().toISOString()}] [${containerId}] [ERROR] Backup failed:`, error);
         updateJobStatus(containerId, 'failed', error.message);
         addHistoryEntry({
             id: Date.now().toString(),
@@ -613,7 +632,7 @@ function shouldSkipVolumePath(image: string, volPath: string): boolean {
 // Helper: Logic to append a container's data into an EXSITING archiver instance
 // Used by both single backup and unified stack backup
 async function archiveContainerInternal(archive: archiver.Archiver, containerId: string, prefix: string = '', customPaths?: string[]): Promise<void> {
-    updateJobStatus(containerId, 'processing', 'Step: Inspecting Container...');
+    logStep(containerId, 'INSPECT', 'Inspecting container...');
     const container = docker.getContainer(containerId);
     const info = await container.inspect();
     const image = info.Config.Image;
@@ -623,7 +642,7 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
 
     // 1. DATABASE DUMP (if applicable)
     if (isDatabaseImage(image)) {
-        updateJobStatus(containerId, 'processing', 'Step: DB Strategy Detected');
+        logStep(containerId, 'DB_STRATEGY', 'Database detected, preparing dump...');
         const backupDir = path.join(process.cwd(), 'backups');
         if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
 
@@ -656,7 +675,7 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
             const timeout = setTimeout(() => {
                 console.error(`[Backup] DB Dump timeout for ${name}`);
                 reject(new Error("DB Dump timeout"));
-            }, 300000);
+            }, 600000); // 10 minutes
 
             exec.start({}, (err: any, stream: any) => {
                 if (err) {
@@ -665,26 +684,41 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
                     return reject(err);
                 }
                 const fileStream = fs.createWriteStream(tempSqlPath);
+                const stderrChunks = [];
+                const stderrStream = {
+                    write(chunk) { stderrChunks.push(chunk); }
+                };
 
                 // Use a safe demux for reliable output capture
-                container.modem.demuxStream(stream, fileStream, process.stderr);
+                container.modem.demuxStream(stream, fileStream, stderrStream);
 
                 stream.on('end', () => {
                     console.log(`[Backup] Stream ended for ${name} DB dump`);
                     fileStream.end();
                 });
 
-                fileStream.on('finish', () => {
+                fileStream.on('finish', async () => {
                     clearTimeout(timeout);
-                    console.log(`[Backup] File stream finished for ${name} DB dump`);
+                    logStep(containerId, 'DB_SUCCESS', `Dump finished for ${name}`);
+                    
                     try {
+                        const info = await exec.inspect();
+                        const exitCode = info.ExitCode;
+                        
+                        if (exitCode !== 0) {
+                            const stderr = Buffer.concat(stderrChunks).toString().trim();
+                            reject(new Error(`DB dump failed (exit ${exitCode}): ${stderr || 'Unknown error'}`));
+                            return;
+                        }
+
                         if (fs.statSync(tempSqlPath).size === 0) {
-                            reject(new Error("Empty SQL Dump"));
+                            const stderr = Buffer.concat(stderrChunks).toString().trim();
+                            reject(new Error(`Empty SQL Dump. Stderr: ${stderr || 'None'}`));
                         } else {
                             resolve();
                         }
-                    } catch (e: any) {
-                        reject(new Error(`SQL Dump file error: ${e.message}`));
+                    } catch (e) {
+                        reject(new Error(`Validation error: ${e.message}`));
                     }
                 });
 
@@ -754,16 +788,16 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
     if (uniquePaths.length > 0) {
         for (const volPath of uniquePaths) {
             try {
-                updateJobStatus(containerId, 'processing', `Archiving: ${volPath}`);
+                logStep(containerId, 'VOLUME', `Archiving volume: ${volPath}`);
                 console.log(`[Backup] Archiving volume ${volPath} for ${containerId}...`);
                 const tarStream = await container.getArchive({ path: volPath });
                 const safeName = volPath.replace(/[\/\\]/g, '_').replace(/^_/, '') + '.tar';
 
                 // Wrap in promise to ensure stream completion if possible, though archiver handle it
                 archive.append(tarStream as any, { name: path.join(prefix, 'volumes', safeName) });
-                console.log(`[Backup] Volume ${volPath} added to archive.`);
+                logStep(containerId, 'VOLUME_SUCCESS', `Archived: ${volPath}`);
             } catch (err: any) {
-                console.error(`[Backup] Failed to archive volume ${volPath}:`, err);
+                console.error(`[${new Date().toISOString()}] [${containerId}] [VOLUME_ERROR] Failed to archive volume ${volPath}:`, err);
                 archive.append(`Failed: ${err.message}`, { name: path.join(prefix, `ERROR_${volPath.replace(/[\/\\]/g, '_')}.txt`) });
             }
         }
@@ -826,7 +860,8 @@ async function handleUpload(containerId: string, filePath: string, resourceUsage
                 '-F', `document=@${filePath}`,
             ];
 
-            const { stdout } = await execFileAsync('curl', curlArgs, { maxBuffer: 1024 * 1024 });
+            logStep(containerId, 'UPLOAD_START', `File size: ${fileSize}`);
+            const { stdout } = await execFileAsync('curl', curlArgs, { maxBuffer: 1024 * 1024, timeout: 600000 });
             const body = JSON.parse((stdout || '{}').trim() || '{}');
             if (!body.ok) throw new Error(`Telegram Upload Failed: ${body.description || 'unknown error'}`);
 
@@ -1449,7 +1484,7 @@ export async function restoreUnifiedStackBackup(filename: string, targetStackNam
             message: msg,
         });
 
-        revalidatePath('/');
+        safeRevalidatePath('/');
         return { success: true, message: msg };
 
     } catch (error: any) {
@@ -1470,7 +1505,7 @@ export async function uploadBackup(formData: FormData) {
     const filePath = path.join(backupDir, file.name);
     fs.writeFileSync(filePath, buffer);
 
-    revalidatePath('/');
+    safeRevalidatePath('/');
     return { success: true, filename: file.name };
 }
 
