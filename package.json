@@ -1,12 +1,12 @@
 {
     "name": "vps-backup-manager",
-    "version": "1.6.0",
+    "version": "1.7.0",
     "private": true,
     "scripts": {
         "dev": "next dev",
         "build": "next build",
         "start": "next start",
-        "lint": "next lint"
+        "lint": "eslint ."
     },
     "dependencies": {
         "@types/adm-zip": "^0.5.7",

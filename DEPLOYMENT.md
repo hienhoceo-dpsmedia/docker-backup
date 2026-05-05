@@ -126,6 +126,32 @@ docker-compose -f docker-compose.prod.yml up -d --force-recreate
 docker-compose -f docker-compose.prod.yml logs -f
 ```
 
+## GitHub Actions Production Deploy
+
+Repository hiện có 2 workflow tách biệt:
+
+- `deploy.yml`: build và push image mới lên GHCR khi push `master` hoặc `main`
+- `deploy-production.yml`: deploy production bằng tay qua `workflow_dispatch`
+
+Để dùng deploy production workflow, cần cấu hình GitHub Environment `production` với các secrets:
+
+- `PRODUCTION_HOST`
+- `PRODUCTION_PORT` (optional, mặc định `22`)
+- `PRODUCTION_USER`
+- `PRODUCTION_SSH_KEY`
+- `PRODUCTION_APP_PATH`
+- `GHCR_USERNAME` (optional nếu package GHCR private)
+- `GHCR_TOKEN` (optional nếu package GHCR private; cần quyền pull package)
+
+Luồng chuẩn:
+
+1. push code lên `master`
+2. chờ image mới build xong trên GHCR
+3. vào Actions -> `Deploy Production`
+4. tick `confirm_production`
+5. chạy workflow để VPS pull `latest` và recreate service `backup-manager`
+6. nếu GHCR package private, workflow sẽ login trên VPS trước khi pull
+
 ## 📝 Troubleshooting
 
 ### "502 Bad Gateway"

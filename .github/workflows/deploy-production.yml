@@ -1,0 +1,52 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: Confirm production deployment
+        required: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy-production:
+    if: ${{ inputs.confirm_production == true }}
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.PRODUCTION_PORT }}"
+          PORT="${PORT:-22}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.PRODUCTION_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$PORT" "${{ secrets.PRODUCTION_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy latest production image
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${{ secrets.PRODUCTION_PORT }}"
+          PORT="${PORT:-22}"
+          ssh -i ~/.ssh/id_ed25519 -p "$PORT" "${{ secrets.PRODUCTION_USER }}@${{ secrets.PRODUCTION_HOST }}" <<EOF
+          set -euo pipefail
+          cd "${{ secrets.PRODUCTION_APP_PATH }}"
+          if [ -n "${{ secrets.GHCR_USERNAME }}" ] && [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+          fi
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker compose -f docker-compose.prod.yml up -d --force-recreate backup-manager
+          docker image prune -f
+          EOF
