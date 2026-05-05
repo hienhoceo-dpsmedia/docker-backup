@@ -354,7 +354,6 @@ export async function deleteStackAction(name: string) {
 
 export async function getContainers() {
     try {
-        logStep(virtualId, 'DISCOVERY', 'Listing containers...');
         const containers = await docker.listContainers({ all: true });
         return containers.map(c => ({
             Id: c.Id,
@@ -654,9 +653,9 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
                     return reject(err);
                 }
                 const fileStream = fs.createWriteStream(tempSqlPath);
-                const stderrChunks = [];
+                const stderrChunks: Buffer[] = [];
                 const stderrStream = {
-                    write(chunk) { stderrChunks.push(chunk); }
+                    write(chunk: Buffer) { stderrChunks.push(chunk); }
                 };
 
                 // Use a safe demux for reliable output capture
@@ -687,7 +686,7 @@ async function archiveContainerInternal(archive: archiver.Archiver, containerId:
                         } else {
                             resolve();
                         }
-                    } catch (e) {
+                    } catch (e: any) {
                         reject(new Error(`Validation error: ${e.message}`));
                     }
                 });

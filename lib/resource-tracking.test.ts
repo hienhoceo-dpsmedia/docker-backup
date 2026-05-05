@@ -6,7 +6,7 @@ import {
     calculateDiskUtilizationPercentFromSamples,
     parseCpuPercent,
     summarizeRuntimeSnapshots,
-} from './resource-tracking.ts';
+} from './resource-tracking';
 
 test('summarizes container runtime snapshots by cpu peak and memory total', () => {
     assert.deepEqual(summarizeRuntimeSnapshots([

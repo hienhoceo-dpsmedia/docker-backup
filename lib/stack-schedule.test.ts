@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { HALF_HOUR_SLOTS, getScheduleOccupancy, getScheduleSlotSummary } from './stack-schedule.ts';
+import { HALF_HOUR_SLOTS, getScheduleOccupancy, getScheduleSlotSummary } from './stack-schedule';
 
 test('builds 48 half-hour slots for a day', () => {
     assert.equal(HALF_HOUR_SLOTS.length, 48);

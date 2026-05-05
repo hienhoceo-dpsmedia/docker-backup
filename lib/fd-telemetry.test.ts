@@ -7,7 +7,7 @@ import {
     filterFdTelemetry,
     mergeFdPeakSnapshots,
     parseContainerFdSnapshotOutput,
-} from './fd-telemetry.ts';
+} from './fd-telemetry';
 
 test('parses fd snapshot rows and skips invalid lines', () => {
     const rows = parseContainerFdSnapshotOutput([
